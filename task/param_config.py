@@ -115,7 +115,7 @@ VERBOSE_STUCK = True
 #   R_wristcam  at /World/robotics/vega_1u_gripper/R_ee_link/gripper_link/R_wristcam
 # Their poses are authored in the USD; nothing here overrides them.
 enable_camera_viewports = True   # show the 3-tile viewport layout in Kit UI
-enable_camera_output    = False   # bind sensors so RGB/depth are readable from Python
+enable_camera_output    = True   # bind sensors so RGB/depth are readable from Python
 HEAD_DEPTH_CAMERA_FOCAL_LENGTH = float(os.getenv("TASK_HEAD_DEPTH_FOCAL_LENGTH", "10"))
 
 # IK c-space size per arm. Three modes per side, picked by the
