@@ -1,0 +1,34 @@
+{
+  "label_type": "single_part_action_chunk",
+  "part_name": "gear_20teeth",
+  "success": true,
+  "score": 1.0,
+  "score_source": "fallback_completion_reason",
+  "completion_reason": "policy_done",
+  "release_mode": "open",
+  "snap_fired": false,
+  "disturb": true,
+  "disturbance_config": {
+    "prob": 0.004,
+    "duration_steps": 20,
+    "pos_max_m": 0.005,
+    "rot_max_deg": 2.0,
+    "seed": 10009
+  },
+  "disturbance_events": [],
+  "output_root": "/home/iris/RoCo_TaskBoardAssembly/artifacts/lerobot_v4_batch/gear_20teeth_disturb_009",
+  "repo_id": "taskboard/v4_batch/gear_20teeth_disturb_009",
+  "recorded_frames": 150,
+  "recorded_parts": [
+    "gear_20teeth"
+  ],
+  "part_completion_reasons": [
+    {
+      "part": "gear_20teeth",
+      "reason": "policy_done",
+      "step_count": 59
+    }
+  ],
+  "sample_fps": 30,
+  "action_encoding": "absolute_cartesian_target_xyz_rotvec_gripper"
+}

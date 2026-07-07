@@ -1,0 +1,93 @@
+{
+  "output_root": "/home/iris/RoCo_TaskBoardAssembly/artifacts/lerobot_v4_batch/gear_20teeth_disturb_008",
+  "repo_id": "taskboard/v4_batch/gear_20teeth_disturb_008",
+  "part_name": "gear_20teeth",
+  "original_part_order": [
+    "gear_20teeth",
+    "gear_60teeth",
+    "rod_16mm",
+    "bolt_8mm",
+    "usb_a",
+    "hdmi",
+    "pin",
+    "battery_size1",
+    "battery_size5"
+  ],
+  "effective_part_order": [
+    "gear_20teeth"
+  ],
+  "label_json": "/home/iris/RoCo_TaskBoardAssembly/artifacts/lerobot_v4_batch/gear_20teeth_disturb_008_label.json",
+  "requested_sample_hz": 30.0,
+  "recording_mode": "time",
+  "sample_stride": null,
+  "sample_fps": 30,
+  "sample_period_s": 0.03333333333333333,
+  "max_recorded_frames": 0,
+  "effective_max_recorded_frames": null,
+  "max_parts": 0,
+  "effective_max_parts": 1,
+  "max_sim_steps": 0,
+  "effective_max_sim_steps": null,
+  "include_depth": false,
+  "disturb": true,
+  "skip_non_ee_actions": true,
+  "joint_dof_per_arm": 7,
+  "action_encoding": "absolute_cartesian_target_xyz_rotvec_gripper",
+  "notes": [
+    "right arm is held at its initial pose by the current runner",
+    "depth is stored as 16-bit PNG images in millimeters",
+    "frames are selected from physics-step callbacks instead of the outer control loop",
+    "stored timestamps are episode-relative physics times written explicitly into the dataset",
+    "sample-hz mode uses simulation-time scheduling so 30 Hz is not rounded down to a fixed 7-step stride",
+    "vega_1u exposes 7 arm joints per side, not 6",
+    "v4 temporarily overrides rp.pc.part_order to a single selected part",
+    "optional EE disturbances perturb executed commands but not stored expert labels"
+  ],
+  "recorded_frames": 150,
+  "recorded_parts": [
+    "gear_20teeth"
+  ],
+  "part_completion_reasons": [
+    {
+      "part": "gear_20teeth",
+      "reason": "policy_done",
+      "step_count": 59
+    }
+  ],
+  "disturbance_events": [],
+  "task_label": {
+    "label_type": "single_part_action_chunk",
+    "part_name": "gear_20teeth",
+    "success": true,
+    "score": 1.0,
+    "score_source": "fallback_completion_reason",
+    "completion_reason": "policy_done",
+    "release_mode": "open",
+    "snap_fired": false,
+    "disturb": true,
+    "disturbance_config": {
+      "prob": 0.004,
+      "duration_steps": 20,
+      "pos_max_m": 0.005,
+      "rot_max_deg": 2.0,
+      "seed": 10008
+    },
+    "disturbance_events": [],
+    "output_root": "/home/iris/RoCo_TaskBoardAssembly/artifacts/lerobot_v4_batch/gear_20teeth_disturb_008",
+    "repo_id": "taskboard/v4_batch/gear_20teeth_disturb_008",
+    "recorded_frames": 150,
+    "recorded_parts": [
+      "gear_20teeth"
+    ],
+    "part_completion_reasons": [
+      {
+        "part": "gear_20teeth",
+        "reason": "policy_done",
+        "step_count": 59
+      }
+    ],
+    "sample_fps": 30,
+    "action_encoding": "absolute_cartesian_target_xyz_rotvec_gripper"
+  },
+  "results_json": "/home/iris/RoCo_TaskBoardAssembly/artifacts/lerobot_v4_batch/gear_20teeth_disturb_008_results.json"
+}

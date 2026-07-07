@@ -140,8 +140,16 @@ def _parse_args() -> argparse.Namespace:
 
 
 def _discover_episode_dirs(source_root: Path, part_name: str, include_disturb: bool) -> List[Path]:
-    clean = sorted(source_root.glob(f"{part_name}_clean_*"))
-    disturb = sorted(source_root.glob(f"{part_name}_disturb_*")) if include_disturb else []
+    # `source_root` also holds loose companion files (e.g.
+    # `gear_20teeth_clean_000_label.json`, `..._results.json`) whose names
+    # start with the same prefix as the episode directories -- filter to
+    # directories only so those aren't picked up as episodes.
+    clean = sorted(p for p in source_root.glob(f"{part_name}_clean_*") if p.is_dir())
+    disturb = (
+        sorted(p for p in source_root.glob(f"{part_name}_disturb_*") if p.is_dir())
+        if include_disturb
+        else []
+    )
     episodes = clean + disturb
     if not episodes:
         raise FileNotFoundError(
