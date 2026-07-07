@@ -27,6 +27,7 @@
     }
   },
   "batch_size": 16,
+  "num_workers": 8,
   "steps": 20000,
   "save_freq": 2000,
   "log_freq": 100,
