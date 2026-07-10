@@ -1,0 +1,39 @@
+{
+  "dataset": {
+    "repo_id": "taskboard/usb_a_left_arm",
+    "root": "training/datasets/usb_a_left_arm",
+    "video_backend": "pyav"
+  },
+  "use_policy_training_preset": true,
+  "policy": {
+    "type": "act",
+    "device": "cuda",
+    "push_to_hub": false,
+    "n_obs_steps": 1,
+    "chunk_size": 50,
+    "n_action_steps": 50,
+    "input_features": {
+      "observation.state": {"type": "STATE", "shape": [22]},
+      "observation.images.head": {"type": "VISUAL", "shape": [3, 240, 320]},
+      "observation.images.left_hand": {"type": "VISUAL", "shape": [3, 240, 320]}
+    },
+    "output_features": {
+      "action": {"type": "ACTION", "shape": [7]}
+    },
+    "normalization_mapping": {
+      "STATE": "MEAN_STD",
+      "VISUAL": "MEAN_STD",
+      "ACTION": "MEAN_STD"
+    }
+  },
+  "batch_size": 16,
+  "num_workers": 8,
+  "steps": 20000,
+  "save_freq": 2000,
+  "log_freq": 100,
+  "output_dir": "./outputs/train/act_usb_a",
+  "job_name": "act_usb_a",
+  "wandb": {
+    "enable": false
+  }
+}
