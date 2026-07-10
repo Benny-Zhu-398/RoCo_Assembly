@@ -291,8 +291,9 @@ PART_CONFIG = {
     # part_poses.json). Tune ee_offset / gripper_open / gripper_close per
     # part by adding the override key when you start testing that part.
     "rod_16mm": {
+        "pick_pos": np.array([0.08863274, 0.05815318, 1.04]),
         "gripper_close":  0.04,
-        "place_pos":      np.array([ 0.24681,  0.16982, 1.057]),
+        "place_pos": np.array([0.24681, 0.16682, 1.057]),
         "ee_offset":      np.array([0.0, 0.016, 0.21]),
         "release_mode":   "snap",
         "snap": {
@@ -385,11 +386,11 @@ PART_CONFIG = {
 
     "gear_20teeth": {
         "gripper_open":   0.12,
-        "gripper_close":  0.065,
+        "gripper_close":  0.07,
         # Lands in the gear_60teeth slot (gear_60teeth was deleted from
         # scene_base.usd; gear_20teeth substitutes for it).
         "pick_pos":       np.array([0.14366, -0.043, 1.04]),
-        "place_pos":      np.array([ 0.1972314984643313, -0.09598882384960386, 1.05398]),
+        "place_pos": np.array([ 0.1972314984643313, -0.09598882384960386, 1.05398]),
         # Final settled pose for grading (gear sinks onto the rack post
         # after release; values measured from a known-good run).
         "grade_pos":      np.array([ 0.1972314984643313,
@@ -610,7 +611,7 @@ SETTLE_DESCEND_PLACE = 15
 # zeros joint velocities every step (see run_pick_place.py), so a longer
 # value gives the arm more steady-state v=0 ticks before the next part's
 # first IK call. 10 ≈ 1 s at the rig's default physics rate.
-RETURN_HOME_SETTLE_STEPS = 10
+RETURN_HOME_SETTLE_STEPS = 50
 
 # Joint-space-interpolated transit between lift_pick and hover_place.
 # Inserts this many waypoints lerped in c-space (see PICK_PLACE_PHASES_
