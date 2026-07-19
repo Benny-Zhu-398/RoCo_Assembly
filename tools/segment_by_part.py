@@ -65,10 +65,15 @@ PART_ORDER = (
     "battery_size5",
 )
 
-# action[6] = left gripper command, normalized open ratio [0,1].
-# open = 0.15 rad / 0.66497 ~= 0.226; close = 0 (or 0.04 rad ~= 0.060 for rod).
+# action[6] = left gripper command. Each part has its OWN open/close width
+# (they overlap across parts, e.g. one part's "open" 0.11 < another's "close"
+# 0.15), so no global threshold works. Instead we exploit the scripted
+# structure: per part the command goes open(o_k) -> close(c_k) -> open(o_k)
+# with c_k < o_k, so after run-length encoding, every "close" plateau is a
+# strict LOCAL MINIMUM among neighboring plateaus, while between-part open
+# adjustments never are (each is flanked by its own part's lower close).
 GRIPPER_ACTION_INDEX = 6
-GRIPPER_THRESHOLD = 0.12   # midpoint with margin between 0.060 and 0.226
+MIN_PLATEAU_FRAMES = 3     # ignore short ramp/transition samples
 MIN_SEGMENT_FRAMES = 10
 
 BOOKKEEPING_KEYS = ("index", "episode_index", "frame_index",
@@ -91,13 +96,29 @@ def load_action_table(src_root: Path):
     return df.sort_values(["episode_index", "frame_index"]).reset_index(drop=True)
 
 
+def rle_plateaus(gripper: np.ndarray):
+    """Run-length encode the command signal into (level, start, end) plateaus,
+    dropping runs shorter than MIN_PLATEAU_FRAMES (ramp/transition samples)."""
+    g = np.round(gripper, 3)
+    change = np.where(np.diff(g) != 0)[0]
+    starts = np.concatenate(([0], change + 1))
+    ends = np.concatenate((change, [len(g) - 1]))
+    levels = g[starts]
+    keep = (ends - starts + 1) >= MIN_PLATEAU_FRAMES
+    return levels[keep], starts[keep], ends[keep]
+
+
 def detect_segments(gripper: np.ndarray):
-    """Split at close->open transitions (release events)."""
-    closed = gripper < GRIPPER_THRESHOLD
-    releases = np.where(closed[:-1] & ~closed[1:])[0]
+    """Split at release events: end of each 'close' plateau, identified as a
+    strict local minimum among consecutive command plateaus."""
+    levels, starts, ends = rle_plateaus(gripper)
+    release_frames = []
+    for i in range(1, len(levels) - 1):
+        if levels[i] < levels[i - 1] and levels[i] < levels[i + 1]:
+            release_frames.append(int(ends[i]))  # last closed frame
     segments, start = [], 0
-    for r in releases:
-        end = int(r) + 1
+    for r in release_frames:
+        end = min(r + 1, len(gripper) - 1)  # include first re-opening frame
         segments.append((start, end))
         start = end + 1
     if segments and start <= len(gripper) - 1:
@@ -110,11 +131,17 @@ def inspect(src_root: Path):
     df = load_action_table(src_root)
     index, bad_episodes = {}, []
 
-    # quick sanity print of the gripper channel value levels
-    a0 = np.stack(df[df["episode_index"] == df["episode_index"].iloc[0]]["action"].to_numpy())
+    # sanity: show the plateau structure of the first episode so the
+    # local-minimum logic can be verified by eye
+    first_ep = df["episode_index"].iloc[0]
+    a0 = np.stack(df[df["episode_index"] == first_ep]["action"].to_numpy())
     g0 = a0[:, GRIPPER_ACTION_INDEX]
-    print(f"Gripper channel sanity (episode 0): min={g0.min():.3f} "
-          f"max={g0.max():.3f} unique_levels~{np.unique(g0.round(2))[:6]}")
+    lv, st, en = rle_plateaus(g0)
+    print(f"Episode {first_ep} gripper plateaus (level @ frames):")
+    print("  " + " -> ".join(f"{l:.3f}@{s}-{e}" for l, s, e in zip(lv, st, en)))
+    n_min = sum(1 for i in range(1, len(lv) - 1)
+                if lv[i] < lv[i - 1] and lv[i] < lv[i + 1])
+    print(f"  local minima (expected releases): {n_min}\n")
 
     for ep_idx, g in df.groupby("episode_index"):
         actions = np.stack(g["action"].to_numpy())
@@ -182,9 +209,19 @@ def rewrite(src_root: Path, index_path: Path = INDEX_PATH):
             for seg in index[ep_idx]:
                 for local_i in range(seg["start"], seg["end"] + 1):
                     item = src[base + local_i]  # decodes video frames
-                    frame = {k: item[k] for k in features}
+                    frame = {}
+                    for k in features:
+                        v = item[k]
+                        if hasattr(v, "numpy"):
+                            v = v.numpy()
+                        # validate_frame requires images as HWC uint8;
+                        # decoded frames come back CHW float in [0,1]
+                        if k.startswith("observation.images") and v.ndim == 3 \
+                                and v.shape[0] in (1, 3):
+                            v = (np.transpose(v, (1, 2, 0)) * 255).astype(np.uint8)
+                        frame[k] = v
                     frame["task"] = seg["part"]
-                    dst.add_frame(frame)   # tensors/CHW-float handled by writer
+                    dst.add_frame(frame)
                 dst.save_episode()
                 print(f"[write] src ep {ep_idx} / {seg['part']} "
                       f"-> dst ep {dst.num_episodes - 1} ({seg['n_frames']} frames)")
