@@ -1,0 +1,10 @@
+# This module is NOT part of the Isaac Sim uv project (pyproject.toml at
+# the repo root is pinned to isaacsim + numpy<2 on Python 3.11 only).
+# Install these in a separate venv, same pattern as the DP eval sidecar
+# (task/dp_server.py) already uses.
+torch>=2.2
+diffusers>=0.27
+numpy
+pandas
+pyarrow
+scipy
