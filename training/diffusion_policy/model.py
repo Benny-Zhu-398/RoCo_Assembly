@@ -1,28 +1,46 @@
 """State-only Diffusion Policy network: StateEncoder + TaskEncoder (FiLM
 task conditioning) + ConditionalUnet1D denoiser.
 
-Architecture follows Chi et al., "Diffusion Policy" (2023): a 1D temporal
-U-Net over the action-chunk axis, with every residual block FiLM-modulated
-by a global conditioning vector (diffusion-timestep embedding concatenated
-with the observation/task conditioning). The down/up-sampling here is kept
-fully symmetric (every down stage halves the temporal length, every up
-stage doubles it back) rather than the paper's asymmetric last-stage
-variant, specifically so it stays correct for arbitrary `horizon` values
-(including non-powers-of-2) instead of only the horizon the paper tuned
-for -- skip connections are length-matched defensively for the same
-reason. This is a functionally equivalent FiLM-conditioned temporal U-Net,
-not a byte-for-byte port.
+ConditionalResidualBlock1D / ConditionalUnet1D below are a faithful port of
+real-stanford/diffusion_policy's
+diffusion_policy/model/diffusion/conditional_unet1d.py (+ conv1d_components.py
++ positional_embedding.py), fetched 2026-07-29. Ported (not hand-derived)
+after a months-long debugging effort on a hand-written version of this
+U-Net turned up a real shape bug in the up-path (see git history) plus a
+persistent, never-fully-explained ceiling on how much the model used state
+conditioning, with every hypothesis that had a clear mechanism (FiLM
+ordering, magnitude imbalance vs the diffusion-step embedding, sampling
+config) ruled out by direct experiment. Swapping in the reference
+implementation is the last diagnostic that can distinguish "our
+hand-written denoiser has a bug we haven't found" from "the problem is
+elsewhere" -- see training/diffusion_policy debugging history.
+
+Deliberately kept different from the reference:
+  - local_cond / impainting-style conditioning: dropped. We only ever use
+    global_cond (state+task FiLM conditioning), never local_cond or
+    masked-impainting trajectories, so that machinery is dead weight here.
+  - cond_predict_scale=True is our default (the reference class defaults
+    to False, i.e. bias-only FiLM: out = out + embed). We use full
+    scale+bias FiLM (out = out*scale + embed), matching what this repo's
+    StateEncoder/TaskEncoder sizing was already designed around.
+  - No einops dependency (not in requirements.txt) -- `rearrange`/
+    `Rearrange` calls are replaced with equivalent `transpose`/`reshape`.
+  - GroupNorm group count is not defensively clamped to a divisor of the
+    channel count (the reference doesn't either): down_dims=(128,256,512)
+    all divide evenly by n_groups=8, so this only matters if down_dims
+    changes to something that doesn't -- in which case nn.GroupNorm raises
+    a clear construction-time error rather than silently doing something
+    else.
 """
 from __future__ import annotations
 
 import math
 import sys
 from pathlib import Path
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 _THIS_DIR = Path(__file__).resolve().parent
 if str(_THIS_DIR) not in sys.path:
@@ -64,6 +82,7 @@ class TaskEncoder(nn.Module):
         return self.embedding(task_idx)
 
 
+# --- ported from diffusion_policy/model/diffusion/positional_embedding.py ---
 class SinusoidalPosEmb(nn.Module):
     def __init__(self, dim: int) -> None:
         super().__init__()
@@ -72,33 +91,39 @@ class SinusoidalPosEmb(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         device = x.device
         half_dim = self.dim // 2
-        emb = math.log(10000) / max(half_dim - 1, 1)
+        emb = math.log(10000) / (half_dim - 1)
         emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
-        emb = x.float()[:, None] * emb[None, :]
+        emb = x[:, None] * emb[None, :]
         emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
-        if self.dim % 2 == 1:
-            emb = F.pad(emb, (0, 1))
         return emb
 
 
-def _num_groups(n_groups: int, channels: int) -> int:
-    """Largest divisor of `channels` that is <= n_groups (GroupNorm requires
-    channels % num_groups == 0; small channel counts like the 7/10-D action
-    space don't divide evenly by the default 8)."""
-    g = min(n_groups, channels)
-    while g > 1 and channels % g != 0:
-        g -= 1
-    return max(g, 1)
+# --- ported from diffusion_policy/model/diffusion/conv1d_components.py ---
+class Downsample1d(nn.Module):
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.conv = nn.Conv1d(dim, dim, 3, 2, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv(x)
+
+
+class Upsample1d(nn.Module):
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.conv = nn.ConvTranspose1d(dim, dim, 4, 2, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv(x)
 
 
 class Conv1dBlock(nn.Module):
-    """Conv1d -> GroupNorm -> Mish."""
+    """Conv1d --> GroupNorm --> Mish."""
 
-    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, n_groups: int) -> None:
+    def __init__(self, inp_channels: int, out_channels: int, kernel_size: int, n_groups: int = 8) -> None:
         super().__init__()
-        n_groups = _num_groups(n_groups, out_channels)
         self.block = nn.Sequential(
-            nn.Conv1d(in_channels, out_channels, kernel_size, padding=kernel_size // 2),
+            nn.Conv1d(inp_channels, out_channels, kernel_size, padding=kernel_size // 2),
             nn.GroupNorm(n_groups, out_channels),
             nn.Mish(),
         )
@@ -107,39 +132,50 @@ class Conv1dBlock(nn.Module):
         return self.block(x)
 
 
+# --- ported from diffusion_policy/model/diffusion/conditional_unet1d.py ---
 class ConditionalResidualBlock1D(nn.Module):
-    """Two Conv1dBlocks with a FiLM modulation (scale, bias) from `cond`
-    applied between them, plus a residual connection."""
-
-    def __init__(self, in_channels: int, out_channels: int, cond_dim: int, kernel_size: int, n_groups: int) -> None:
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        cond_dim: int,
+        kernel_size: int = 3,
+        n_groups: int = 8,
+        cond_predict_scale: bool = True,
+    ) -> None:
         super().__init__()
-        self.block1 = Conv1dBlock(in_channels, out_channels, kernel_size, n_groups)
-        self.block2 = Conv1dBlock(out_channels, out_channels, kernel_size, n_groups)
+        self.blocks = nn.ModuleList([
+            Conv1dBlock(in_channels, out_channels, kernel_size, n_groups=n_groups),
+            Conv1dBlock(out_channels, out_channels, kernel_size, n_groups=n_groups),
+        ])
+
+        # FiLM modulation https://arxiv.org/abs/1709.07871 -- predicts
+        # per-channel scale and bias (cond_predict_scale=True) or bias only.
+        cond_channels = out_channels * 2 if cond_predict_scale else out_channels
+        self.cond_predict_scale = cond_predict_scale
+        self.out_channels = out_channels
         self.cond_encoder = nn.Sequential(
             nn.Mish(),
-            nn.Linear(cond_dim, out_channels * 2),
+            nn.Linear(cond_dim, cond_channels),
         )
+
         self.residual_conv = (
             nn.Conv1d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
         )
 
     def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
-        out = self.block1(x)
-        scale, bias = self.cond_encoder(cond).chunk(2, dim=-1)   # each (B, out_channels)
-        out = out * scale.unsqueeze(-1) + bias.unsqueeze(-1)     # FiLM
-        out = self.block2(out)
+        """x: (B, in_channels, horizon). cond: (B, cond_dim). Returns (B, out_channels, horizon)."""
+        out = self.blocks[0](x)
+        embed = self.cond_encoder(cond)
+        if self.cond_predict_scale:
+            embed = embed.reshape(embed.shape[0], 2, self.out_channels, 1)
+            scale = embed[:, 0, ...]
+            bias = embed[:, 1, ...]
+            out = scale * out + bias
+        else:
+            out = out + embed.unsqueeze(-1)
+        out = self.blocks[1](out)
         return out + self.residual_conv(x)
-
-
-def _match_length(x: torch.Tensor, target_len: int) -> torch.Tensor:
-    """Pad or crop the last (time) dim of x to target_len. Handles the
-    off-by-one lengths that show up for non-power-of-2 horizons."""
-    cur_len = x.shape[-1]
-    if cur_len == target_len:
-        return x
-    if cur_len > target_len:
-        return x[..., :target_len]
-    return F.pad(x, (0, target_len - cur_len))
 
 
 class ConditionalUnet1D(nn.Module):
@@ -151,81 +187,94 @@ class ConditionalUnet1D(nn.Module):
         down_dims: Tuple[int, ...] = (256, 512, 1024),
         kernel_size: int = 5,
         n_groups: int = 8,
+        cond_predict_scale: bool = True,
     ) -> None:
         super().__init__()
         all_dims = [input_dim] + list(down_dims)
-        cond_dim = diffusion_step_embed_dim + global_cond_dim
+        start_dim = down_dims[0]
 
+        dsed = diffusion_step_embed_dim
         self.diffusion_step_encoder = nn.Sequential(
-            SinusoidalPosEmb(diffusion_step_embed_dim),
-            nn.Linear(diffusion_step_embed_dim, diffusion_step_embed_dim * 4),
+            SinusoidalPosEmb(dsed),
+            nn.Linear(dsed, dsed * 4),
             nn.Mish(),
-            nn.Linear(diffusion_step_embed_dim * 4, diffusion_step_embed_dim),
+            nn.Linear(dsed * 4, dsed),
         )
+        cond_dim = dsed + global_cond_dim
 
         in_out = list(zip(all_dims[:-1], all_dims[1:]))
 
-        self.down_modules = nn.ModuleList()
-        for dim_in, dim_out in in_out:
-            self.down_modules.append(nn.ModuleList([
-                ConditionalResidualBlock1D(dim_in, dim_out, cond_dim, kernel_size, n_groups),
-                ConditionalResidualBlock1D(dim_out, dim_out, cond_dim, kernel_size, n_groups),
-                nn.Conv1d(dim_out, dim_out, kernel_size=3, stride=2, padding=1),
-            ]))
-
         mid_dim = all_dims[-1]
         self.mid_modules = nn.ModuleList([
-            ConditionalResidualBlock1D(mid_dim, mid_dim, cond_dim, kernel_size, n_groups),
-            ConditionalResidualBlock1D(mid_dim, mid_dim, cond_dim, kernel_size, n_groups),
+            ConditionalResidualBlock1D(mid_dim, mid_dim, cond_dim, kernel_size, n_groups, cond_predict_scale),
+            ConditionalResidualBlock1D(mid_dim, mid_dim, cond_dim, kernel_size, n_groups, cond_predict_scale),
         ])
 
+        self.down_modules = nn.ModuleList()
+        for ind, (dim_in, dim_out) in enumerate(in_out):
+            is_last = ind >= (len(in_out) - 1)
+            self.down_modules.append(nn.ModuleList([
+                ConditionalResidualBlock1D(dim_in, dim_out, cond_dim, kernel_size, n_groups, cond_predict_scale),
+                ConditionalResidualBlock1D(dim_out, dim_out, cond_dim, kernel_size, n_groups, cond_predict_scale),
+                Downsample1d(dim_out) if not is_last else nn.Identity(),
+            ]))
+
+        # NOTE (matches the reference exactly): this iterates reversed(in_out[1:]),
+        # i.e. it DROPS the shallowest down-stage's skip connection -- the up
+        # path never consumes it, reconstructing the final resolution purely
+        # from its own upsampling. len(up_modules) == len(down_modules) - 1.
         self.up_modules = nn.ModuleList()
-        for dim_in, dim_out in reversed(in_out):
+        for ind, (dim_in, dim_out) in enumerate(reversed(in_out[1:])):
+            is_last = ind >= (len(in_out) - 1)
             self.up_modules.append(nn.ModuleList([
-                ConditionalResidualBlock1D(dim_out * 2, dim_out, cond_dim, kernel_size, n_groups),
-                ConditionalResidualBlock1D(dim_out, dim_in, cond_dim, kernel_size, n_groups),
-                nn.ConvTranspose1d(dim_in, dim_in, kernel_size=4, stride=2, padding=1),
+                ConditionalResidualBlock1D(dim_out * 2, dim_in, cond_dim, kernel_size, n_groups, cond_predict_scale),
+                ConditionalResidualBlock1D(dim_in, dim_in, cond_dim, kernel_size, n_groups, cond_predict_scale),
+                Upsample1d(dim_in) if not is_last else nn.Identity(),
             ]))
 
         self.final_conv = nn.Sequential(
-            Conv1dBlock(input_dim, input_dim, kernel_size, n_groups=n_groups),
-            nn.Conv1d(input_dim, input_dim, 1),
+            Conv1dBlock(start_dim, start_dim, kernel_size=kernel_size),
+            nn.Conv1d(start_dim, input_dim, 1),
         )
 
-    def forward(self, sample: torch.Tensor, timestep: torch.Tensor, global_cond: torch.Tensor) -> torch.Tensor:
-        """sample: (B, T, input_dim). Returns predicted noise, (B, T, input_dim)."""
-        x = sample.transpose(1, 2)  # (B, input_dim, T)
-        orig_len = x.shape[-1]
+    def forward(
+        self,
+        sample: torch.Tensor,
+        timestep: torch.Tensor,
+        global_cond: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """sample: (B, horizon, input_dim). Returns predicted noise, (B, horizon, input_dim)."""
+        x = sample.transpose(1, 2)  # (B, input_dim, horizon)
 
-        if not torch.is_tensor(timestep):
-            timestep = torch.tensor([timestep], device=sample.device)
-        if timestep.ndim == 0:
-            timestep = timestep.unsqueeze(0)
-        timestep = timestep.expand(sample.shape[0]).to(sample.device)
-        step_feat = self.diffusion_step_encoder(timestep)          # (B, diffusion_step_embed_dim)
-        cond = torch.cat([step_feat, global_cond], dim=-1)         # (B, cond_dim)
+        timesteps = timestep
+        if not torch.is_tensor(timesteps):
+            timesteps = torch.tensor([timesteps], dtype=torch.long, device=sample.device)
+        elif timesteps.ndim == 0:
+            timesteps = timesteps[None].to(sample.device)
+        timesteps = timesteps.expand(sample.shape[0])
+
+        global_feature = self.diffusion_step_encoder(timesteps)
+        if global_cond is not None:
+            global_feature = torch.cat([global_feature, global_cond], dim=-1)
 
         skips = []
         for resblock1, resblock2, downsample in self.down_modules:
-            x = resblock1(x, cond)
-            x = resblock2(x, cond)
+            x = resblock1(x, global_feature)
+            x = resblock2(x, global_feature)
             skips.append(x)
             x = downsample(x)
 
         for mid in self.mid_modules:
-            x = mid(x, cond)
+            x = mid(x, global_feature)
 
         for resblock1, resblock2, upsample in self.up_modules:
-            skip = skips.pop()
-            x = _match_length(x, skip.shape[-1])
-            x = torch.cat([x, skip], dim=1)
-            x = resblock1(x, cond)
-            x = resblock2(x, cond)
+            x = torch.cat((x, skips.pop()), dim=1)
+            x = resblock1(x, global_feature)
+            x = resblock2(x, global_feature)
             x = upsample(x)
 
-        x = _match_length(x, orig_len)
         x = self.final_conv(x)
-        return x.transpose(1, 2)  # (B, T, input_dim)
+        return x.transpose(1, 2)  # (B, horizon, input_dim)
 
 
 class DiffusionPolicyNet(nn.Module):
@@ -260,4 +309,4 @@ class DiffusionPolicyNet(nn.Module):
     ) -> torch.Tensor:
         """noisy_action: (B, horizon, action_dim). Returns predicted noise, same shape."""
         cond = self.global_cond(state, task_idx)
-        return self.unet(noisy_action, timestep, cond)
+        return self.unet(noisy_action, timestep, global_cond=cond)

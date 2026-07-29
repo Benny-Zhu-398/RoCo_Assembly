@@ -99,7 +99,7 @@
     "left_gripper"
   ],
   "meta": {
-    "dataset_root": "D:\\DESKTOP\\RoCo_Assembly\\tools\\roco2026_by_part",
+    "dataset_root": "C:\\Users\\haozh\\repos\\RoCo_Assembly\\tools\\roco2026_by_part",
     "parts": [
       "gear_20teeth",
       "gear_60teeth",

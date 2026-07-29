@@ -70,7 +70,13 @@ STATE_NAMES = tuple(STATE_NAMES_FULL[i] for i in LEFT_STATE_IDX)
 STATE_XYZ_SLICE = slice(0, 3)
 STATE_QUAT_SLICE = slice(3, 7)      # wxyz, unit norm
 STATE_JPOS_SLICE = slice(7, 14)
-STATE_JVEL_SLICE = slice(14, 21)
+STATE_JVEL_SLICE = slice(14, 21)  # NOT a reliable ee-linear-speed proxy: on the
+# battery_size1/gear_60teeth val sets, ||jvel|| vs. the action-diff ee linear
+# speed (||action_xyz[t+1]-action_xyz[t]||*FPS) has spearman rho=-0.157 and
+# -0.162 respectively (see speed_error_analysis.py) -- joint-space speed does
+# not track end-effector speed here (Jacobian/redundancy effects), so any
+# future velocity-based modeling (distance metrics, contact-force warm-start)
+# should use the action-diff ee linear speed, not this slice's norm.
 STATE_GRIPPER_IDX = 21
 
 # --- action, 14-D (tools/roco2026_by_part/meta/info.json) ---
