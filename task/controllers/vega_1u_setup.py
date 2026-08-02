@@ -75,6 +75,95 @@ def _set_camera_focal_length(stage, camera_prim_path: str, focal_length: float):
     print(f"[setup] set {camera_prim_path} focalLength={float(focal_length):.6g}")
 
 
+def _create_fixed_camera_from_authored(
+    stage,
+    source_prim_path: str,
+    fixed_prim_path: str,
+    name: str,
+    resolution,
+    frequency: float,
+):
+    """Clone an authored camera's world pose and optics onto a world prim."""
+    source_prim = stage.GetPrimAtPath(source_prim_path) if stage else None
+    if not source_prim or not source_prim.IsValid():
+        raise RuntimeError(
+            f"cannot create fixed camera; missing source {source_prim_path!r}"
+        )
+
+    source_camera = UsdGeom.Camera(source_prim)
+    world_matrix = UsdGeom.XformCache().GetLocalToWorldTransform(source_prim)
+    world_position = np.asarray(
+        world_matrix.ExtractTranslation(), dtype=np.float64
+    )
+    world_quat = world_matrix.ExtractRotationQuat()
+    world_orientation_usd = np.asarray(
+        [world_quat.GetReal(), *world_quat.GetImaginary()], dtype=np.float64
+    )
+
+    fixed_camera = Camera(
+        prim_path=fixed_prim_path,
+        name=name,
+        resolution=resolution,
+        frequency=frequency,
+    )
+    fixed_camera.set_world_pose(
+        position=world_position,
+        orientation=world_orientation_usd,
+        camera_axes="usd",
+    )
+
+    fixed_camera.set_focal_length(
+        float(source_camera.GetFocalLengthAttr().Get())
+    )
+    fixed_camera.set_horizontal_aperture(
+        float(source_camera.GetHorizontalApertureAttr().Get()),
+        maintain_square_pixels=False,
+    )
+    fixed_camera.set_vertical_aperture(
+        float(source_camera.GetVerticalApertureAttr().Get()),
+        maintain_square_pixels=False,
+    )
+    fixed_camera.set_focus_distance(
+        float(source_camera.GetFocusDistanceAttr().Get())
+    )
+    clipping_range = source_camera.GetClippingRangeAttr().Get()
+    fixed_camera.set_clipping_range(
+        near_distance=float(clipping_range[0]),
+        far_distance=float(clipping_range[1]),
+    )
+
+    print(
+        f"[setup] fixed head camera source={source_prim_path} "
+        f"path={fixed_prim_path} position={world_position.tolist()} "
+        f"orientation_usd_wxyz={world_orientation_usd.tolist()}",
+        flush=True,
+    )
+    return fixed_camera
+
+
+def sync_fixed_camera_to_source(
+    fixed_camera: Camera,
+    source_prim_path: str,
+):
+    """Move a world-fixed sensor to the source camera's current USD pose."""
+    stage = omni.usd.get_context().get_stage()
+    source_prim = stage.GetPrimAtPath(source_prim_path) if stage else None
+    if not source_prim or not source_prim.IsValid():
+        raise RuntimeError(f"missing camera source {source_prim_path!r}")
+    world_matrix = UsdGeom.XformCache().GetLocalToWorldTransform(source_prim)
+    position = np.asarray(world_matrix.ExtractTranslation(), dtype=np.float64)
+    quat = world_matrix.ExtractRotationQuat()
+    orientation_usd = np.asarray(
+        [quat.GetReal(), *quat.GetImaginary()], dtype=np.float64
+    )
+    fixed_camera.set_world_pose(
+        position=position,
+        orientation=orientation_usd,
+        camera_axes="usd",
+    )
+    return position, orientation_usd
+
+
 def find_ground_world_z(default: float = 0.0) -> float:
     """Walk the open stage and return the world-space z of the ground prim.
 
@@ -298,6 +387,27 @@ def restore_scene_part_xforms():
         n_restored += 1
 
 
+def set_rigid_body_kinematic(stage, prim_path: str, enabled: bool = True):
+    """Set one registered rigid body's kinematic state before simulation play."""
+    prim = stage.GetPrimAtPath(prim_path) if stage else None
+    if not prim or not prim.IsValid():
+        raise RuntimeError(f"missing rigid-body prim {prim_path!r}")
+    if not prim.HasAPI(UsdPhysics.RigidBodyAPI):
+        raise RuntimeError(f"prim {prim_path!r} has no PhysicsRigidBodyAPI")
+
+    rigid_body = UsdPhysics.RigidBodyAPI(prim)
+    rigid_body.GetKinematicEnabledAttr().Set(bool(enabled))
+    if enabled:
+        rigid_body.GetVelocityAttr().Set(Gf.Vec3f(0.0, 0.0, 0.0))
+        rigid_body.GetAngularVelocityAttr().Set(Gf.Vec3f(0.0, 0.0, 0.0))
+    print(
+        f"[setup] rigid body {prim_path} "
+        f"kinematicEnabled={bool(enabled)} velocity=[0, 0, 0] "
+        f"angularVelocity=[0, 0, 0]",
+        flush=True,
+    )
+
+
 def open_scene_and_world():
     """Open scene_base.usd into a fresh stage and create the World."""
     scene_path = _resolve_scene_path()
@@ -333,6 +443,8 @@ def _finalize_pick_place_setup(
     flag_robot_state_update: bool = False,
     enable_camera_viewports: bool = True,
     enable_camera_output: bool = True,
+    fixed_head_camera: bool = False,
+    fix_task_board: bool = False,
     base_translation_offset=None,
 ):
     """Reset the world, build per-arm PickPlaceControllers, cameras, viewports.
@@ -342,6 +454,9 @@ def _finalize_pick_place_setup(
     """
     # ---- World reset: registers articulations & rigid bodies.
     my_world.reset()
+    if fix_task_board:
+        stage = omni.usd.get_context().get_stage()
+        set_rigid_body_kinematic(stage, pc.L_object_prim_path, enabled=True)
 
 # ---- Per-arm controllers on the shared /vega_1u articulation.
     task_params = my_world.get_task(task_name).get_params()
@@ -423,10 +538,12 @@ def _finalize_pick_place_setup(
     # only (optionally) wrap them as Camera sensors so RGB/depth are
     # readable from Python, and/or open viewport tiles in Kit UI.
     HEAD_DEPTH_CAMERA_PATH = f"{ROBOT_PRIM_PATH}/zed_depth_frame/headcam"
+    FIXED_HEAD_CAMERA_PATH = "/World/pi05_fixed_headcam"
     L_WRIST_CAMERA_PATH    = f"{ROBOT_PRIM_PATH}/L_ee_link/gripper_link/L_wristcam"
     R_WRIST_CAMERA_PATH    = f"{ROBOT_PRIM_PATH}/R_ee_link/gripper_link/R_wristcam"
 
     head_depth_camera = None
+    fixed_head_camera_sensor = None
     L_wrist_camera = None
     R_wrist_camera = None
 
@@ -453,16 +570,28 @@ def _finalize_pick_place_setup(
             HEAD_DEPTH_CAMERA_PATH,
             getattr(pc, "HEAD_DEPTH_CAMERA_FOCAL_LENGTH", 18.147562),
         )
+        if fixed_head_camera:
+            fixed_head_camera_sensor = _create_fixed_camera_from_authored(
+                _stage,
+                source_prim_path=HEAD_DEPTH_CAMERA_PATH,
+                fixed_prim_path=FIXED_HEAD_CAMERA_PATH,
+                name="Pi05FixedHeadCam",
+                resolution=(640, 480),
+                frequency=30.0,
+            )
 
     if enable_camera_output:
         # Wrap each USD camera as an Isaac Sim Camera sensor. Resolution
         # is the sensor buffer size (not authored on the USD prim).
-        head_depth_camera = Camera(
-            prim_path=HEAD_DEPTH_CAMERA_PATH,
-            name="HeadDepthCam",
-            resolution=(640, 480),
-            frequency=30.0,
-        )
+        if fixed_head_camera_sensor is not None:
+            head_depth_camera = fixed_head_camera_sensor
+        else:
+            head_depth_camera = Camera(
+                prim_path=HEAD_DEPTH_CAMERA_PATH,
+                name="HeadDepthCam",
+                resolution=(640, 480),
+                frequency=30.0,
+            )
         L_wrist_camera = Camera(
             prim_path=L_WRIST_CAMERA_PATH,
             name="LWristCam",
@@ -482,7 +611,10 @@ def _finalize_pick_place_setup(
     if enable_camera_viewports:
         # 3-tile viewport layout in Kit UI, stacked along the left edge.
         # Independent of sensor binding.
-        create_viewport_for_camera(viewport_name="Head Depth View",  camera_prim_path=HEAD_DEPTH_CAMERA_PATH,
+        head_viewport_path = (
+            FIXED_HEAD_CAMERA_PATH if fixed_head_camera else HEAD_DEPTH_CAMERA_PATH
+        )
+        create_viewport_for_camera(viewport_name="Head Depth View",  camera_prim_path=head_viewport_path,
                                    width=240, height=200, position_x=50, position_y=50)
         create_viewport_for_camera(viewport_name="L Wrist View",     camera_prim_path=L_WRIST_CAMERA_PATH,
                                    width=240, height=200, position_x=50, position_y=250)
@@ -540,6 +672,8 @@ def setup_pick_place_sim(
     flag_robot_state_update: bool = False,
     enable_camera_viewports: bool = True,
     enable_camera_output: bool = True,
+    fixed_head_camera: bool = False,
+    fix_task_board: bool = False,
     base_translation_offset=None,
 ):
     """Build the 2-part bimanual pick-and-place world from the pre-built scene.
@@ -549,7 +683,8 @@ def setup_pick_place_sim(
     my_world : isaacsim World
     my_controller : dict {"L": PickPlaceController, "R": PickPlaceController}
     my_robots : dict {"L": SingleManipulator, "R": SingleManipulator}
-    head_depth_camera : Camera sensor wrapping the USD-authored headcam, or None
+    head_depth_camera : Camera sensor wrapping the authored headcam, or a
+        world-fixed copy when ``fixed_head_camera`` is enabled, or None
     L_wrist_camera, R_wrist_camera : Camera sensors wrapping the USD-authored
         wrist cams, or None when ``enable_camera_output`` is False
     articulation_controller : the shared ArticulationController for /vega_1u
@@ -578,5 +713,7 @@ def setup_pick_place_sim(
         flag_robot_state_update=flag_robot_state_update,
         enable_camera_viewports=enable_camera_viewports,
         enable_camera_output=enable_camera_output,
+        fixed_head_camera=fixed_head_camera,
+        fix_task_board=fix_task_board,
         base_translation_offset=base_translation_offset,
     )

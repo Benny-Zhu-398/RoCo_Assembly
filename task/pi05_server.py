@@ -10,6 +10,7 @@ import os
 import pickle
 import struct
 import sys
+import time
 import warnings
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
@@ -45,6 +46,24 @@ sys.stderr.flush()
 
 _in = sys.stdin.buffer
 _out = sys.stdout.buffer
+request_index = 0
+queue_capacity = int(policy.config.n_action_steps)
+queued_actions_remaining = 0
+
+
+def _queue_state():
+    return queued_actions_remaining, queue_capacity
+
+
+def _action_to_numpy(action):
+    if isinstance(action, dict):
+        action = action[ACTION]
+    action_np = action.squeeze(0).float().cpu().numpy().reshape(-1)
+    if action_np.shape != (14,):
+        raise RuntimeError(f"expected 14-D pi0.5 action, got shape {action_np.shape}")
+    if not np.isfinite(action_np).all():
+        raise RuntimeError("pi0.5 action contains non-finite values")
+    return action_np
 
 
 def _read():
@@ -86,9 +105,74 @@ while True:
     if msg is None:
         break
     if msg.get("cmd") == "reset":
+        queue_before, queue_maxlen = _queue_state()
         policy.reset()
+        queued_actions_remaining = 0
+        queue_after, _ = _queue_state()
+        sys.stderr.write(
+            f"[pi05_server] reset queue_before={queue_before} "
+            f"queue_after={queue_after} queue_maxlen={queue_maxlen}\n"
+        )
+        sys.stderr.flush()
         _write({"ok": True})
         continue
+
+    if msg.get("cmd") == "next_action":
+        request_index += 1
+        queue_before, queue_maxlen = _queue_state()
+        if queue_before is None or queue_before <= 0:
+            error = "action queue is empty; send a full observation request first"
+            sys.stderr.write(
+                f"[pi05_server] request={request_index} cmd=next_action "
+                f"queue_before={queue_before} queue_maxlen={queue_maxlen} "
+                f"error={error}\n"
+            )
+            sys.stderr.flush()
+            _write({"ok": False, "error": error})
+            continue
+
+        with torch.inference_mode():
+            started = time.perf_counter()
+            action = policy.select_action({})
+            select_action_ms = (time.perf_counter() - started) * 1000.0
+            queued_actions_remaining -= 1
+
+            started = time.perf_counter()
+            action = postprocessor(action)
+            postprocessor_ms = (time.perf_counter() - started) * 1000.0
+        action_np = _action_to_numpy(action)
+        queue_after, _ = _queue_state()
+        sys.stderr.write(
+            f"[pi05_server] request={request_index} cmd=next_action "
+            f"queue_before={queue_before} queue_after={queue_after} "
+            f"queue_maxlen={queue_maxlen} select_action_ms={select_action_ms:.3f} "
+            f"postprocessor_ms={postprocessor_ms:.3f}\n"
+        )
+        sys.stderr.flush()
+        _write({"ok": True, "action": action_np.tolist()})
+        continue
+
+    try:
+        exec_horizon = int(msg.get("exec_horizon", 1))
+    except (TypeError, ValueError):
+        _write({"ok": False, "error": "exec_horizon must be an integer"})
+        continue
+    max_horizon = int(policy.config.n_action_steps)
+    if not 1 <= exec_horizon <= max_horizon:
+        _write(
+            {
+                "ok": False,
+                "error": f"exec_horizon must be between 1 and {max_horizon}",
+            }
+        )
+        continue
+
+    discarded_actions = 0
+    if exec_horizon > 1:
+        queue_before_replan, _ = _queue_state()
+        discarded_actions = queue_before_replan or 0
+        policy.reset()
+        queued_actions_remaining = 0
 
     obs = {
         "observation.state": torch.as_tensor(msg["state"], dtype=torch.float32),
@@ -98,15 +182,58 @@ while True:
         "task": msg.get("task", TASK),
     }
 
+    request_index += 1
+    queue_before, queue_maxlen = _queue_state()
     with torch.inference_mode():
+        started = time.perf_counter()
         batch = preprocessor(obs)
+        preprocessor_ms = (time.perf_counter() - started) * 1000.0
+
+        started = time.perf_counter()
         action = policy.select_action(batch)
+        select_action_ms = (time.perf_counter() - started) * 1000.0
+        queued_actions_remaining = (
+            queue_capacity - 1
+            if queue_before == 0
+            else max(queue_before - 1, 0)
+        )
+        queue_after, _ = _queue_state()
+
+        started = time.perf_counter()
         action = postprocessor(action)
-    if isinstance(action, dict):
-        action = action[ACTION]
-    action_np = action.squeeze(0).float().cpu().numpy().reshape(-1)
-    if action_np.shape != (14,):
-        raise RuntimeError(f"expected 14-D pi0.5 action, got shape {action_np.shape}")
-    if not np.isfinite(action_np).all():
-        raise RuntimeError("pi0.5 action contains non-finite values")
-    _write({"action": action_np.tolist()})
+        postprocessor_ms = (time.perf_counter() - started) * 1000.0
+    action_np = _action_to_numpy(action)
+    action_chunk = [action_np]
+    queued_select_action_ms = 0.0
+    queued_postprocessor_ms = 0.0
+    for _ in range(1, exec_horizon):
+        queue_remaining, _ = _queue_state()
+        if not queue_remaining:
+            break
+        with torch.inference_mode():
+            started = time.perf_counter()
+            queued_action = policy.select_action({})
+            queued_select_action_ms += (time.perf_counter() - started) * 1000.0
+            queued_actions_remaining -= 1
+
+            started = time.perf_counter()
+            queued_action = postprocessor(queued_action)
+            queued_postprocessor_ms += (time.perf_counter() - started) * 1000.0
+        action_chunk.append(_action_to_numpy(queued_action))
+    queue_after_chunk, _ = _queue_state()
+    sys.stderr.write(
+        f"[pi05_server] request={request_index} cmd=observation "
+        f"queue_before={queue_before} queue_after={queue_after} "
+        f"queue_maxlen={queue_maxlen} preprocessor_ms={preprocessor_ms:.3f} "
+        f"select_action_ms={select_action_ms:.3f} "
+        f"postprocessor_ms={postprocessor_ms:.3f} exec_horizon={exec_horizon} "
+        f"chunk_length={len(action_chunk)} discarded_actions={discarded_actions} "
+        f"queue_after_chunk={queue_after_chunk} "
+        f"queued_select_action_ms={queued_select_action_ms:.3f} "
+        f"queued_postprocessor_ms={queued_postprocessor_ms:.3f}\n"
+    )
+    sys.stderr.flush()
+    reply = {"ok": True, "action": action_np.tolist()}
+    if exec_horizon > 1:
+        reply["actions"] = [item.tolist() for item in action_chunk]
+    _write(reply)

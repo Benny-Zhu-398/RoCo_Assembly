@@ -16,6 +16,7 @@
 import os
 import subprocess
 import sys
+import time
 
 _LAUNCH_CWD = os.getcwd()
 
@@ -59,13 +60,16 @@ import numpy as np
 
 import param_config as pc
 from controllers.vega_1u_setup import (
-    restore_scene_part_xforms, setup_pick_place_sim,
+    restore_scene_part_xforms,
+    setup_pick_place_sim,
+    sync_fixed_camera_to_source,
 )
 from controllers.part_from_usd import DynamicPart
 from isaacsim.core.api.materials.physics_material import PhysicsMaterial
 from isaacsim.core.utils.prims import is_prim_path_valid
 from isaacsim.core.utils.stage import add_reference_to_stage
 from isaacsim.core.utils.types import ArticulationAction
+from deferred_video import DeferredFrameVideoRecorder
 from policy_api import EnvInfo, Observation, PartTarget
 
 # Physics material prim authored in the scene USD; bound to every spawned
@@ -104,6 +108,8 @@ _R_OFFSET_FK_TO_STAGE = np.array([0.0, 0.0, 0.0, -1.0], dtype=np.float64)
 
 
 class FfmpegVideoRecorder:
+    deferred = False
+
     def __init__(self, path, fps=30, camera="head"):
         self.path = path
         self.fps = int(fps)
@@ -691,6 +697,13 @@ def _parse_args():
         help="Output video frame rate. Frames are sampled from sim time.",
     )
     parser.add_argument(
+        "--record-video-deferred",
+        action="store_true",
+        default=_env_flag("ROCO_RECORD_VIDEO_DEFERRED"),
+        help="Spool PNG frames and encode after Isaac exits. This avoids a "
+             "live ffmpeg pipe during Windows simulation.",
+    )
+    parser.add_argument(
         "--max-steps",
         type=int,
         default=_env_int("ROCO_EVAL_MAX_STEPS"),
@@ -711,14 +724,91 @@ def _parse_args():
         help="Stop after this many parts have ended by policy done, snap, "
              "or timeout.",
     )
+    parser.add_argument(
+        "--pi05-one-step-dry-run",
+        action="store_true",
+        help="Capture one real observation and request one raw prediction "
+             "without applying any robot action.",
+    )
+    parser.add_argument(
+        "--pi05-dry-run-log",
+        default="artifacts/pi05_one_step_dry_run.log",
+        help="Output log for --pi05-one-step-dry-run.",
+    )
+    parser.add_argument(
+        "--pi05-ik-dry-run",
+        action="store_true",
+        help="Request one prediction and solve IK without applying the returned action.",
+    )
+    parser.add_argument(
+        "--pi05-ik-dry-run-log",
+        default="artifacts/pi05_ik_dry_run.log",
+        help="Output log for --pi05-ik-dry-run.",
+    )
+    parser.add_argument(
+        "--pi05-five-request-diagnostic",
+        action="store_true",
+        help="Send 5 raw requests for one real observation without applying actions.",
+    )
+    parser.add_argument(
+        "--pi05-five-request-log",
+        default="artifacts/pi05_five_request_timing.log",
+        help="Output log for --pi05-five-request-diagnostic.",
+    )
+    parser.add_argument(
+        "--pi05-continuous-episode",
+        action="store_true",
+        default=_env_flag("PI05_CONTINUOUS_EPISODE"),
+        help="Run one continuous pi0.5 episode with one reset and all snap "
+             "detectors active.",
+    )
+    parser.add_argument(
+        "--fix-task-board",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Make the task-board rigid body kinematic. Defaults on for "
+             "Pi05LeRobotPolicy and off for other policies.",
+    )
+    parser.add_argument(
+        "--policy-control-hz",
+        type=float,
+        default=_env_float("PI05_CONTROL_HZ"),
+        help="Update the policy at this simulated-time frequency and hold the "
+             "last articulation target between updates.",
+    )
     # SimulationApp consumes argv too; tolerate unknown args so the runner
     # can be launched as ${ISAAC_SIM}/python.sh run_pick_place.py --policy ...
     args = parser.parse_known_args()[0]
+    diagnostic_mode_count = sum(
+        bool(value)
+        for value in (
+            args.pi05_one_step_dry_run,
+            args.pi05_ik_dry_run,
+            args.pi05_five_request_diagnostic,
+        )
+    )
+    if diagnostic_mode_count > 1:
+        parser.error("pi0.5 dry-run diagnostic modes are mutually exclusive")
+    if args.policy_control_hz is not None and args.policy_control_hz <= 0:
+        parser.error("--policy-control-hz must be positive")
+    if args.pi05_continuous_episode:
+        if args.max_steps is None:
+            parser.error("--pi05-continuous-episode requires --max-steps")
+        if args.policy_control_hz is None:
+            args.policy_control_hz = 10.0
+    if args.record_video_deferred and not args.record_video:
+        parser.error("--record-video-deferred requires --record-video")
     for attr in ("max_steps", "max_sim_seconds", "max_parts"):
         value = getattr(args, attr, None)
         if value is not None and value <= 0:
             setattr(args, attr, None)
-    for attr in ("results_json", "record_video"):
+    for attr in (
+        "results_json",
+        "record_video",
+        "pi05_dry_run_log",
+        "pi05_ik_dry_run_log",
+        "pi05_five_request_log",
+    ):
         value = getattr(args, attr, None)
         if value and not os.path.isabs(value):
             setattr(args, attr, os.path.abspath(os.path.join(_LAUNCH_CWD, value)))
@@ -747,7 +837,24 @@ def _load_policy_class(dotted_path: str):
 
 def main():
     args = _parse_args()
-    video_recorder = FfmpegVideoRecorder(
+    pi05_policy_enabled = args.policy.endswith(".Pi05LeRobotPolicy")
+    fix_task_board_enabled = (
+        pi05_policy_enabled
+        if args.fix_task_board is None
+        else bool(args.fix_task_board)
+    )
+    fixed_head_camera_enabled = bool(
+        pi05_policy_enabled
+        or args.pi05_one_step_dry_run
+        or args.pi05_five_request_diagnostic
+        or args.pi05_continuous_episode
+    )
+    recorder_class = (
+        DeferredFrameVideoRecorder
+        if args.record_video_deferred
+        else FfmpegVideoRecorder
+    )
+    video_recorder = recorder_class(
         args.record_video,
         fps=args.record_video_fps,
         camera=args.record_video_camera,
@@ -755,11 +862,23 @@ def main():
     record_period_s = 1.0 / float(max(1, args.record_video_fps))
     next_record_time_s = 0.0
     camera_output_enabled = bool(pc.enable_camera_output or video_recorder.enabled)
-    exit_on_complete = bool(_HEADLESS or video_recorder.enabled)
+    camera_viewports_enabled = bool(pc.enable_camera_viewports and not _HEADLESS)
+    auto_play = bool(
+        _HEADLESS
+        or args.pi05_one_step_dry_run
+        or args.pi05_five_request_diagnostic
+        or args.pi05_continuous_episode
+    )
+    exit_on_complete = bool(auto_play or video_recorder.enabled)
     run_complete = False
     finalized = False
     total_task_steps = 0
     completed_parts = 0
+    five_request_reset_sent = False
+    continuous_loop_steps = 0
+    next_policy_time_s = None
+    held_merged_action = None
+    fixed_head_camera_ready = not fixed_head_camera_enabled
 
     # The task signature still requires L/R object prim paths. Point both
     # at a STATIC prim so the task's SingleRigidPrim wrapper never aliases
@@ -777,8 +896,10 @@ def main():
         R_target_position=_DUMMY_TARGET,
         joint_opened_position=np.array([pc.PART_DEFAULTS["gripper_open"]]),
         joint_closed_position=np.array([pc.PART_DEFAULTS["gripper_close"]]),
-        enable_camera_viewports=pc.enable_camera_viewports,
+        enable_camera_viewports=camera_viewports_enabled,
         enable_camera_output=camera_output_enabled,
+        fixed_head_camera=fixed_head_camera_enabled,
+        fix_task_board=fix_task_board_enabled,
     )
 
     # Spawn any pc.part_order entries that aren't already in the loaded scene.
@@ -817,6 +938,21 @@ def main():
     # R: latch init pose, command those joints every step.
     R_arm_hold_q = np.asarray(L_robot.get_joint_positions())[R_arm_dof_indices].astype(np.float64)
 
+    # The learned policy only commands the left arm and gripper. In continuous
+    # mode, keep the shared base and head-camera chain at the post-reset pose so
+    # uncommanded joints cannot drift while one action is held between updates.
+    continuous_hold_joint_names = (
+        "Lift", "torso_flip", "head_j1", "head_j2", "head_j3",
+    )
+    initial_full_q = np.asarray(
+        L_robot.get_joint_positions(), dtype=np.float64
+    )
+    continuous_hold_targets = {
+        name: float(initial_full_q[dof_names.index(name)])
+        for name in continuous_hold_joint_names
+        if name in dof_names
+    }
+
     # Snapshot the L arm's c-space joint vector at startup. The baseline
     # policy uses this as the return-home target between parts; other
     # policies can use it for whatever (or ignore it).
@@ -851,6 +987,8 @@ def main():
     current_part = None
     current_snap_attacher = None
     current_snap_sub = None
+    continuous_snap_attachers = {}
+    continuous_snap_subs = []
     snap_fired_parts = set()
     part_step_count = 0
     PER_PART_TIMEOUT_STEPS = int(getattr(pc, "PER_PART_TIMEOUT_STEPS", 3000))
@@ -861,8 +999,11 @@ def main():
         # by a stray physx event between the two None assignments.
         current_snap_sub = None
         current_snap_attacher = None
+        continuous_snap_subs.clear()
+        continuous_snap_attachers.clear()
 
-    def _build_observation():
+    def _build_observation(with_timings=False):
+        observation_start = time.perf_counter()
         full_q = np.asarray(L_robot.get_joint_positions(), dtype=np.float64)
         try:
             full_qd = np.asarray(L_robot.get_joint_velocities(), dtype=np.float64)
@@ -890,6 +1031,7 @@ def main():
         rgb = {"head": None, "L_wrist": None, "R_wrist": None}
         depth = {"head": None, "L_wrist": None, "R_wrist": None}
         intrinsics = {"head": None, "L_wrist": None, "R_wrist": None}
+        camera_start = time.perf_counter()
         if camera_output_enabled:
             for key, cam in (("head", head_depth_camera),
                              ("L_wrist", L_wrist_camera),
@@ -916,10 +1058,17 @@ def main():
                 except Exception:
                     pass
 
-        snap_fired = bool(current_snap_attacher is not None
-                          and current_snap_attacher.attached)
+        camera_capture_ms = (time.perf_counter() - camera_start) * 1000.0
+        if args.pi05_continuous_episode:
+            snap_fired = any(
+                attacher.attached
+                for attacher in continuous_snap_attachers.values()
+            )
+        else:
+            snap_fired = bool(current_snap_attacher is not None
+                              and current_snap_attacher.attached)
 
-        return Observation(
+        obs = Observation(
             step_idx=int(my_world.current_time_step_index),
             joint_positions=full_q,
             joint_velocities=full_qd,
@@ -929,8 +1078,20 @@ def main():
             depth=depth,
             intrinsics=intrinsics,
             snap_fired=snap_fired,
-            target_part=current_part if isinstance(current_part, str) else None,
+            target_part=(
+                None
+                if args.pi05_continuous_episode
+                else (current_part if isinstance(current_part, str) else None)
+            ),
         )
+        if with_timings:
+            return obs, {
+                "camera_capture": camera_capture_ms,
+                "observation_construction": (
+                    time.perf_counter() - observation_start
+                ) * 1000.0,
+            }
+        return obs
 
     def _build_part_target(name):
         cfg = pc.get_part_config(name)
@@ -960,6 +1121,13 @@ def main():
         if finalized:
             return
         finalized = True
+        final_full_q = np.asarray(
+            L_robot.get_joint_positions(), dtype=np.float64
+        )
+        continuous_hold_actual = {
+            name: float(final_full_q[dof_names.index(name)])
+            for name in continuous_hold_targets
+        }
         metadata = {
             "completion_reason": reason,
             "current_part": current_part,
@@ -973,6 +1141,18 @@ def main():
             "max_sim_seconds": args.max_sim_seconds,
             "max_parts": args.max_parts,
             "snap_fired_parts": sorted(snap_fired_parts),
+            "pi05_continuous_episode": bool(args.pi05_continuous_episode),
+            "fixed_head_camera": bool(fixed_head_camera_enabled),
+            "camera_viewports": bool(camera_viewports_enabled),
+            "task_board_fixed": bool(fix_task_board_enabled),
+            "policy_control_hz": args.policy_control_hz,
+            "continuous_loop_steps": int(continuous_loop_steps),
+            "continuous_hold_targets": (
+                continuous_hold_targets if args.pi05_continuous_episode else {}
+            ),
+            "continuous_hold_actual": (
+                continuous_hold_actual if args.pi05_continuous_episode else {}
+            ),
         }
         _grade_task(stage, snap_fired_parts,
                     results_json_path=args.results_json,
@@ -985,6 +1165,7 @@ def main():
         """Advance to the next part: build snap attacher, call policy.reset()."""
         nonlocal current_part, current_snap_attacher, current_snap_sub
         nonlocal part_step_count, run_complete, completed_parts
+        nonlocal five_request_reset_sent
 
         # Record previous part's snap status before clearing.
         if (current_part is not None
@@ -1033,15 +1214,74 @@ def main():
 
         obs = _build_observation()
         target = _build_part_target(current_part)
-        policy.reset(obs, target)
+        if not args.pi05_five_request_diagnostic or not five_request_reset_sent:
+            policy.reset(obs, target)
+            if args.pi05_five_request_diagnostic:
+                five_request_reset_sent = True
         part_step_count = 0
         print(f"now working on the part: {current_part}", flush=True)
         return current_part
+
+    def _start_continuous_episode():
+        """Reset pi0.5 once and keep every snap detector active."""
+        nonlocal current_part, part_step_count
+        current_part = None
+        for part_name in pc.part_order:
+            cfg = pc.get_part_config(part_name)
+            if cfg.get("release_mode", "open") != "snap":
+                continue
+            snap_cfg = cfg.get("snap")
+            if snap_cfg is None:
+                raise ValueError(
+                    f"part {part_name!r} has release_mode='snap' but no snap config"
+                )
+            attacher = build_snap_attacher(stage, part_name, snap_cfg)
+            continuous_snap_attachers[part_name] = attacher
+            continuous_snap_subs.append(
+                physx_iface.subscribe_physics_step_events(
+                    lambda dt, a=attacher: a.update()
+                )
+            )
+            print(
+                f"[pi05-continuous] snap detector part={part_name} "
+                f"movable={snap_cfg['movable_path']}",
+                flush=True,
+            )
+
+        first_part = next(iter(pc.part_order))
+        policy.reset(_build_observation(), _build_part_target(first_part))
+        part_step_count = 0
+        print(
+            f"[pi05-continuous] started one episode control_hz="
+            f"{args.policy_control_hz:g} max_policy_steps={args.max_steps}",
+            flush=True,
+        )
+        print(
+            f"[pi05-continuous] holding support joints "
+            f"{continuous_hold_targets}",
+            flush=True,
+        )
+
+    def _merge_left_with_right_hold(L_action):
+        R_action_positions = [None] * len(dof_names)
+        for j_idx, val in zip(R_arm_dof_indices, R_arm_hold_q.tolist()):
+            R_action_positions[j_idx] = float(val)
+        R_action = ArticulationAction(joint_positions=R_action_positions)
+        merged = merge_bimanual_actions(L_action, R_action, dof_names)
+        if args.pi05_continuous_episode:
+            merged_positions = list(merged.joint_positions)
+            for name, value in continuous_hold_targets.items():
+                merged_positions[dof_names.index(name)] = value
+            merged = ArticulationAction(joint_positions=merged_positions)
+        return merged
 
     def _restart_iteration():
         nonlocal parts_iter, current_part
         nonlocal next_record_time_s, run_complete
         nonlocal total_task_steps, completed_parts, finalized
+        nonlocal continuous_loop_steps, next_policy_time_s
+        nonlocal held_merged_action
+        nonlocal fixed_head_camera_ready
         _clear_snap_state()
         snap_fired_parts.clear()
         run_complete = False
@@ -1049,6 +1289,10 @@ def main():
         total_task_steps = 0
         completed_parts = 0
         next_record_time_s = 0.0
+        continuous_loop_steps = 0
+        next_policy_time_s = None
+        held_merged_action = None
+        fixed_head_camera_ready = not fixed_head_camera_enabled
         # Remove any FixedJoints that snap_attach authored on previous
         # iterations. Joints live in USD and persist across my_world.stop()
         # / play(), so without cleanup the bolt (and any other snap part)
@@ -1064,10 +1308,13 @@ def main():
         restore_scene_part_xforms()
         parts_iter = iter(pc.part_order)
         current_part = None
-        _start_next_part()
+        if args.pi05_continuous_episode:
+            _start_continuous_episode()
+        else:
+            _start_next_part()
 
     _restart_iteration()
-    if exit_on_complete:
+    if auto_play:
         try:
             my_world.play()
         except Exception:
@@ -1083,7 +1330,7 @@ def main():
             if not my_world.is_playing():
                 if my_world.is_stopped():
                     reset_needed = True
-                if not exit_on_complete:
+                if not auto_play:
                     continue
 
             if reset_needed:
@@ -1093,7 +1340,7 @@ def main():
                 L_controller.reset()
                 R_controller.reset()
                 _restart_iteration()
-                if exit_on_complete:
+                if auto_play:
                     try:
                         my_world.play()
                     except Exception:
@@ -1104,7 +1351,7 @@ def main():
                 L_controller.reset()
                 R_controller.reset()
                 _restart_iteration()
-                if exit_on_complete:
+                if auto_play:
                     try:
                         my_world.play()
                     except Exception:
@@ -1117,12 +1364,162 @@ def main():
             if (_warmup_steps > 0
                     and my_world.current_time_step_index < _warmup_steps):
                 _apply_init_joint_targets()
+                if args.pi05_continuous_episode:
+                    empty_action = ArticulationAction(
+                        joint_positions=[None] * len(dof_names)
+                    )
+                    articulation_controller.apply_action(
+                        _merge_left_with_right_hold(empty_action)
+                    )
+                if fixed_head_camera_enabled:
+                    sync_fixed_camera_to_source(
+                        head_depth_camera,
+                        "/World/robotics/vega_1u_gripper/"
+                        "zed_depth_frame/headcam",
+                    )
                 if my_world.current_time_step_index == _warmup_steps - 1:
                     print(f"[setup] warmup done ({_warmup_steps} steps); "
                           f"starting task.")
                 continue
 
-            if current_part is None:
+            if fixed_head_camera_enabled and not fixed_head_camera_ready:
+                position, orientation = sync_fixed_camera_to_source(
+                    head_depth_camera,
+                    "/World/robotics/vega_1u_gripper/zed_depth_frame/headcam",
+                )
+                fixed_head_camera_ready = True
+                print(
+                    f"[setup] froze pi0.5 head camera after warmup "
+                    f"position={position.tolist()} "
+                    f"orientation_usd_wxyz={orientation.tolist()}",
+                    flush=True,
+                )
+                # Render the newly frozen pose before constructing the first
+                # policy observation.
+                continue
+
+            if current_part is None and not args.pi05_continuous_episode:
+                continue
+
+            if args.pi05_five_request_diagnostic:
+                obs, observation_timings = _build_observation(with_timings=True)
+                diagnostic = getattr(policy, "five_request_diagnostic", None)
+                if not callable(diagnostic):
+                    raise RuntimeError(
+                        "selected policy does not support five-request diagnostic"
+                    )
+                diagnostic(obs, args.pi05_five_request_log, observation_timings)
+                print(
+                    "[diagnostic] 5 predictions recorded; no robot action applied.",
+                    flush=True,
+                )
+                run_complete = True
+                break
+
+            if args.pi05_one_step_dry_run:
+                obs, observation_timings = _build_observation(with_timings=True)
+                dry_run = getattr(policy, "one_step_dry_run", None)
+                if not callable(dry_run):
+                    raise RuntimeError(
+                        "selected policy does not support one-step dry-run"
+                    )
+                dry_run(obs, args.pi05_dry_run_log, observation_timings)
+                print(
+                    "[dry-run] prediction recorded; no robot action applied.",
+                    flush=True,
+                )
+                run_complete = True
+                break
+
+            if args.pi05_ik_dry_run:
+                obs, observation_timings = _build_observation(with_timings=True)
+                ik_dry_run = getattr(policy, "ik_dry_run", None)
+                if not callable(ik_dry_run):
+                    raise RuntimeError(
+                        "selected policy does not support IK dry-run"
+                    )
+                ik_dry_run(
+                    obs,
+                    args.pi05_ik_dry_run_log,
+                    observation_timings,
+                )
+                print(
+                    "[dry-run] IK diagnostics recorded; action was not applied.",
+                    flush=True,
+                )
+                run_complete = True
+                break
+
+            if args.pi05_continuous_episode:
+                sim_time_s = (
+                    my_world.current_time_step_index * env_info.physics_dt
+                )
+                policy_period_s = 1.0 / float(args.policy_control_hz)
+                policy_due = (
+                    next_policy_time_s is None
+                    or sim_time_s + 1e-9 >= next_policy_time_s
+                )
+                video_due = (
+                    video_recorder.enabled
+                    and sim_time_s + 1e-9 >= next_record_time_s
+                )
+                obs = _build_observation() if policy_due or video_due else None
+
+                if video_due:
+                    video_recorder.write(obs.rgb.get(video_recorder.camera))
+                    while next_record_time_s <= sim_time_s + 1e-9:
+                        next_record_time_s += record_period_s
+
+                for part_name, attacher in continuous_snap_attachers.items():
+                    if attacher.attached:
+                        snap_fired_parts.add(part_name)
+
+                if (args.max_sim_seconds
+                        and sim_time_s + 1e-9 >= args.max_sim_seconds):
+                    run_complete = True
+                    print(
+                        f"[pi05-continuous] reached max-sim-seconds="
+                        f"{args.max_sim_seconds:g}; ending.",
+                        flush=True,
+                    )
+                    _finalize_iteration("max_sim_seconds")
+                    break
+
+                if policy_due:
+                    if total_task_steps >= args.max_steps:
+                        run_complete = True
+                        print(
+                            f"[pi05-continuous] reached max-policy-steps="
+                            f"{args.max_steps}; ending.",
+                            flush=True,
+                        )
+                        _finalize_iteration("max_policy_steps")
+                        break
+                    if policy.is_done(obs):
+                        run_complete = True
+                        print("[pi05-continuous] policy reported done.", flush=True)
+                        _finalize_iteration("policy_done")
+                        break
+
+                    held_merged_action = _merge_left_with_right_hold(policy.act(obs))
+                    total_task_steps += 1
+                    part_step_count += 1
+                    if next_policy_time_s is None:
+                        next_policy_time_s = sim_time_s + policy_period_s
+                    else:
+                        while next_policy_time_s <= sim_time_s + 1e-9:
+                            next_policy_time_s += policy_period_s
+                    if total_task_steps == 1 or total_task_steps % 25 == 0:
+                        print(
+                            f"[pi05-continuous] policy_step={total_task_steps} "
+                            f"sim_time_s={sim_time_s:.3f} "
+                            f"snap_fired={sorted(snap_fired_parts)}",
+                            flush=True,
+                        )
+
+                if held_merged_action is not None:
+                    articulation_controller.apply_action(held_merged_action)
+                continuous_loop_steps += 1
                 continue
 
             obs = _build_observation()
@@ -1176,18 +1573,26 @@ def main():
 
             L_action = policy.act(obs)
 
-            R_action_positions = [None] * len(dof_names)
-            for j_idx, val in zip(R_arm_dof_indices, R_arm_hold_q.tolist()):
-                R_action_positions[j_idx] = float(val)
-            R_action = ArticulationAction(joint_positions=R_action_positions)
-
-            merged = merge_bimanual_actions(L_action, R_action, dof_names)
+            merged = _merge_left_with_right_hold(L_action)
             articulation_controller.apply_action(merged)
 
             part_step_count += 1
     finally:
-        video_recorder.close()
-        simulation_app.close()
+        try:
+            close_policy = getattr(policy, "close", None)
+            if callable(close_policy):
+                close_policy()
+        finally:
+            if getattr(video_recorder, "deferred", False):
+                try:
+                    simulation_app.close()
+                finally:
+                    video_recorder.close()
+            else:
+                try:
+                    video_recorder.close()
+                finally:
+                    simulation_app.close()
 
 
 if __name__ == "__main__":
