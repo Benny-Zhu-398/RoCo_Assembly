@@ -99,7 +99,21 @@ RIGHT_ACTION_NAMES = tuple(ACTION_NAMES_FULL[i] for i in RIGHT_ACTION_IDX)
 
 # Slices *within* the 7-D left action.
 ACTION_XYZ_SLICE = slice(0, 3)
-ACTION_ROT_SLICE = slice(3, 6)      # rotvec, axis-angle, NOT canonical-range
+# ACTION_ROT_SLICE dims are Euler XYZ EXTRINSIC angles (R = Rz@Ry@Rx), NOT
+# rotvec/axis-angle -- this was wrongly assumed rotvec by every consumer of
+# this constant until rotation_convention_audit.py settled it empirically
+# (comparing both decodes' geodesic distance to same-frame state quaternions
+# across all 9 parts: Euler-XYZ-extrinsic median/mean/p90 ~0.6/4.0/3.4 deg
+# vs. rotvec's ~1.0/16.1/60.9 deg). Applies to THIS dataset
+# (tools/roco2026_by_part, sliced from the public HF
+# rocochallenge2025/rocochallenge2026_Industrial_Assembly by
+# tools/segment_by_part.py) only -- the self-collected
+# collect_lerobot_v3.py/v4.py datasets ARE true rotvec (metadata:
+# "absolute_cartesian_target_xyz_rotvec_gripper") and do not import this
+# module's constants at all (they define their own layout). See
+# task/policies/diffusion_stateonly.py's ACTION ROTATION CONVENTION
+# docstring section for the deployment-side fix this required.
+ACTION_ROT_SLICE = slice(3, 6)
 ACTION_GRIPPER_IDX = 6
 
 DATASET_FPS = 10.0

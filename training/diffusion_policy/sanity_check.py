@@ -49,7 +49,7 @@ if str(_THIS_DIR) not in sys.path:
 from config import ExperimentConfig, resolve_repo_path  # noqa: E402
 from constants import ACTION_GRIPPER_IDX, ACTION_NAMES, ACTION_ROT_SLICE, ACTION_XYZ_SLICE, PART_TO_IDX  # noqa: E402
 from dataset import PartSequenceDataset  # noqa: E402
-from inference_utils import ddim_sample, geodesic_angle_deg  # noqa: E402
+from inference_utils import ddim_sample, geodesic_angle_deg_euler_xyz  # noqa: E402
 from model import DiffusionPolicyNet  # noqa: E402
 from normalization import NormStats, unnormalize_action  # noqa: E402
 from train import masked_mse  # noqa: E402
@@ -195,7 +195,9 @@ def main() -> None:
     valid = ~is_pad.cpu().numpy()
 
     pos_err_mm = np.linalg.norm(pred[..., ACTION_XYZ_SLICE] - gt[..., ACTION_XYZ_SLICE], axis=-1) * 1000.0
-    ang_err_deg = geodesic_angle_deg(pred[..., ACTION_ROT_SLICE], gt[..., ACTION_ROT_SLICE])
+    # Euler XYZ extrinsic, not rotvec -- see rotation_convention_audit.py
+    # and inference_utils.geodesic_angle_deg's docstring.
+    ang_err_deg = geodesic_angle_deg_euler_xyz(pred[..., ACTION_ROT_SLICE], gt[..., ACTION_ROT_SLICE])
     gripper_err = np.abs(pred[..., ACTION_GRIPPER_IDX] - gt[..., ACTION_GRIPPER_IDX])
 
     print(f"\n[sanity_check] DDIM-sampled vs GT on the {len(overfit_ds)} overfit samples "
