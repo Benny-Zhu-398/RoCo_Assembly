@@ -81,6 +81,13 @@ class PartSequenceDataset(Dataset):
                 state = state_full[:, LEFT_STATE_IDX].astype(np.float32)
                 action = action_full[:, LEFT_ACTION_IDX].astype(np.float32)
 
+                # NOTE: this dataset's action rotation dims (ACTION_ROT_SLICE) are
+                # Euler XYZ extrinsic, NOT rotvec -- see constants.py's
+                # ACTION_ROT_SLICE comment and rotation_convention_audit.py.
+                # find_rotvec_jumps is still a valid generic ">pi raw-component-diff"
+                # discontinuity check regardless of that (it doesn't require rotvec
+                # semantics), but read every "rotvec jump" in this warning as "jump in
+                # the 3 raw rotation numbers", not literally rotvec.
                 jump_frames = find_rotvec_jumps(action[:, ACTION_ROT_SLICE])
                 for t in jump_frames:
                     record = {"part": part, "episode_index": int(ep), "frame": int(t)}
@@ -93,6 +100,13 @@ class PartSequenceDataset(Dataset):
                     )
 
                 if rotation_repr == "rot6d":
+                    # WRONG for this dataset as written: rotvec_to_rot6d decodes
+                    # ACTION_ROT_SLICE as rotvec via Rotation.from_rotvec, but it's
+                    # actually Euler XYZ extrinsic (see rotation_utils.py's module
+                    # docstring and rotation_convention_audit.py). Never exercised
+                    # end-to-end (config.py: only rotation_repr="rotvec" has been
+                    # trained) -- fix the conversion to build the rotation matrix via
+                    # Euler-XYZ-extrinsic before ever training with rotation_repr="rot6d".
                     rot6d = rotvec_to_rot6d(action[:, ACTION_ROT_SLICE])
                     action = np.concatenate(
                         [action[:, :3], rot6d, action[:, 6:7]], axis=-1

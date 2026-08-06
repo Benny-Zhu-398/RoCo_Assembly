@@ -45,10 +45,18 @@ class ModelConfig:
     task_emb_dim: int = 32
     state_hidden_dim: int = 128
     state_feature_dim: int = 128
-    # "rotvec" (default, matches the raw action encoding) or "rot6d"
-    # (Zhou et al. 2019 continuous repr; reserved for later, see
-    # rotation_utils.py — dataset.py and this config both branch on it but
-    # only "rotvec" has been exercised end-to-end).
+    # "rotvec" (default) or "rot6d" (Zhou et al. 2019 continuous repr;
+    # reserved for later, see rotation_utils.py -- dataset.py and this
+    # config both branch on it but only "rotvec" has been exercised
+    # end-to-end). NOTE: "rotvec" here is a misnomer for
+    # tools/roco2026_by_part -- its action rotation dims are actually
+    # Euler XYZ extrinsic (see constants.py's ACTION_ROT_SLICE comment and
+    # rotation_convention_audit.py), not rotvec. This default path is
+    # harmless regardless (dataset.py passes the 3 raw dims through
+    # verbatim, no geometric conversion happens), but the "rot6d" branch
+    # DOES geometrically convert via an explicit rotvec assumption
+    # (rotation_utils.rotvec_to_rot6d) and is currently wrong for this
+    # dataset if ever trained -- fix that conversion first.
     rotation_repr: str = "rotvec"
     diffusion_step_embed_dim: int = 128
     #need to change back to the previous version later

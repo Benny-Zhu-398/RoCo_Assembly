@@ -167,11 +167,73 @@ def geodesic_angle_deg(rotvec_pred: np.ndarray, rotvec_gt: np.ndarray) -> np.nda
     known to occur in this dataset's action encoding (see
     rotation_utils.find_rotvec_jumps).
 
+    Inputs are interpreted as ROTATION VECTORS (axis-angle). Only valid for
+    action data actually encoded that way -- confirmed true for the
+    self-collected collect_lerobot_v3.py/v4.py datasets (metadata:
+    "absolute_cartesian_target_xyz_rotvec_gripper"), confirmed FALSE for
+    tools/roco2026_by_part (see rotation_convention_audit.py: its action
+    rotation dims are Euler XYZ extrinsic, not rotvec). Use
+    `geodesic_angle_deg_euler_xyz` below for anything derived from
+    PartSequenceDataset (evaluate.py, sanity_check.py) -- this function is
+    for the true-rotvec datasets only.
+
     rotvec_pred / rotvec_gt: (..., 3). Returns (...,) in degrees.
     """
     shape = rotvec_pred.shape[:-1]
     Rp = _rotvec_to_matrix(rotvec_pred).reshape(-1, 3, 3)
     Rg = _rotvec_to_matrix(rotvec_gt).reshape(-1, 3, 3)
+    R_rel = np.einsum("nij,njk->nik", Rp.transpose(0, 2, 1), Rg)
+    trace = np.einsum("nii->n", R_rel)
+    cos_angle = np.clip((trace - 1.0) / 2.0, -1.0, 1.0)
+    angle_rad = np.arccos(cos_angle)
+    return np.degrees(angle_rad).reshape(shape)
+
+
+def _euler_xyz_extrinsic_to_matrix(euler: np.ndarray) -> np.ndarray:
+    """(..., 3) [rx, ry, rz] Euler-XYZ EXTRINSIC angles -> (..., 3, 3),
+    i.e. R = Rz(rz) @ Ry(ry) @ Rx(rx) (scipy's lowercase 'xyz' convention).
+
+    This is the convention tools/roco2026_by_part's action rotation dims
+    actually use -- empirically confirmed in rotation_convention_audit.py
+    by comparing against same-frame state quaternions: pooled across all 9
+    parts, decoding this way gives median/mean/p90 geodesic error of
+    ~0.6/4.0/3.4 deg vs. ~1.0/16.1/60.9 deg for the axis-angle (rotvec)
+    decode this metric used before, and ~1.0/22.3/103.5 deg for the
+    intrinsic 'XYZ' variant. Do not decode roco2026_by_part's action
+    rotation dims any other way.
+    """
+    e = np.asarray(euler, dtype=np.float64).reshape(-1, 3)
+    zeros, ones = np.zeros(e.shape[0]), np.ones(e.shape[0])
+
+    def axis_mat(axis: str, a: np.ndarray) -> np.ndarray:
+        c, s = np.cos(a), np.sin(a)
+        if axis == "x":
+            m = np.stack([ones, zeros, zeros, zeros, c, -s, zeros, s, c], axis=-1)
+        elif axis == "y":
+            m = np.stack([c, zeros, s, zeros, ones, zeros, -s, zeros, c], axis=-1)
+        else:
+            m = np.stack([c, -s, zeros, s, c, zeros, zeros, zeros, ones], axis=-1)
+        return m.reshape(-1, 3, 3)
+
+    Rx, Ry, Rz = axis_mat("x", e[:, 0]), axis_mat("y", e[:, 1]), axis_mat("z", e[:, 2])
+    R = np.einsum("nij,njk->nik", Rz, Ry)
+    R = np.einsum("nij,njk->nik", R, Rx)
+    return R.reshape(euler.shape[:-1] + (3, 3))
+
+
+def geodesic_angle_deg_euler_xyz(euler_pred: np.ndarray, euler_gt: np.ndarray) -> np.ndarray:
+    """Same geodesic-distance metric as `geodesic_angle_deg`, but interprets
+    its inputs as Euler-XYZ EXTRINSIC angles instead of rotvec -- the
+    correct convention for tools/roco2026_by_part's action rotation dims
+    (see `_euler_xyz_extrinsic_to_matrix` and rotation_convention_audit.py).
+    Use this, not `geodesic_angle_deg`, for any action-rotation error metric
+    computed from a PartSequenceDataset-derived action.
+
+    euler_pred / euler_gt: (..., 3). Returns (...,) in degrees.
+    """
+    shape = euler_pred.shape[:-1]
+    Rp = _euler_xyz_extrinsic_to_matrix(euler_pred).reshape(-1, 3, 3)
+    Rg = _euler_xyz_extrinsic_to_matrix(euler_gt).reshape(-1, 3, 3)
     R_rel = np.einsum("nij,njk->nik", Rp.transpose(0, 2, 1), Rg)
     trace = np.einsum("nii->n", R_rel)
     cos_angle = np.clip((trace - 1.0) / 2.0, -1.0, 1.0)

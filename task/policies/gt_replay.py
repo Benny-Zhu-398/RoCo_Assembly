@@ -67,9 +67,19 @@ from policy_api import EnvInfo, Observation, PartTarget, Policy  # noqa: E402
 DATASET_FPS = 10.0  # training/diffusion_policy/constants.py::DATASET_FPS
 
 
-def _rotvec_to_quat_wxyz(rx, ry, rz):
+def _euler_xyz_to_quat_wxyz(rx, ry, rz):
+    """Euler XYZ EXTRINSIC angles -> wxyz quat. The exported actions here
+    come from training/diffusion_policy/export_val_episodes.py, which reads
+    tools/roco2026_by_part -- that dataset's action rotation dims are Euler
+    XYZ extrinsic, NOT rotvec/axis-angle (this function used to decode them
+    as rotvec; see task/policies/diffusion_stateonly.py's module docstring
+    ACTION ROTATION CONVENTION section and
+    training/diffusion_policy/rotation_convention_audit.py for how that was
+    confirmed -- same bug, same fix, same dataset). Do not reuse this
+    decoder for a rotvec-convention dataset (collect_lerobot_v3.py/v4.py,
+    policies/act_eval_usb.py/act_eval_gear.py)."""
     from scipy.spatial.transform import Rotation
-    x, y, z, w = Rotation.from_rotvec([rx, ry, rz]).as_quat()
+    x, y, z, w = Rotation.from_euler("xyz", [rx, ry, rz]).as_quat()
     return np.array([w, x, y, z], dtype=np.float64)
 
 
@@ -121,7 +131,7 @@ class GTReplayPolicy(Policy):
         a = self._actions[frame]
         self._step_count += 1
         pos = a[:3]
-        quat = _rotvec_to_quat_wxyz(a[3], a[4], a[5])
+        quat = _euler_xyz_to_quat_wxyz(a[3], a[4], a[5])
         grip = float(a[6])  # raw joint radians, recorded verbatim -- see diffusion_stateonly.py's GRIPPER UNITS note
         return self.L.forward(pos, quat, grip)
 

@@ -51,7 +51,7 @@ from dataset import PartSequenceDataset  # noqa: E402
 from inference_utils import (  # noqa: E402
     build_model_from_checkpoint,
     ddim_sample,
-    geodesic_angle_deg,
+    geodesic_angle_deg_euler_xyz,
     load_checkpoint,
     load_norm_stats_from_checkpoint,
     part_to_idx_from_checkpoint,
@@ -182,7 +182,14 @@ def run_eval(
     valid = ~is_pad
 
     pos_err_mm = np.linalg.norm(pred_xyz - gt_xyz, axis=-1) * 1000.0
-    ang_err_deg = geodesic_angle_deg(pred_rotvec, gt_rotvec)
+    # pred_rotvec/gt_rotvec are misnamed (kept for variable-name continuity
+    # with ACTION_ROT_SLICE) -- tools/roco2026_by_part's action rotation
+    # dims are Euler XYZ extrinsic, not rotvec; see
+    # rotation_convention_audit.py and inference_utils.geodesic_angle_deg's
+    # docstring. Using the rotvec-based metric here silently underreported
+    # orientation error (small per-step deltas look similar under either
+    # convention; only large reorientations diverge).
+    ang_err_deg = geodesic_angle_deg_euler_xyz(pred_rotvec, gt_rotvec)
     gripper_err = np.abs(pred_gripper - gt_gripper)
 
     gripper_levels = np.linspace(

@@ -17,6 +17,55 @@ python -m venv .venv-dp && source .venv-dp/bin/activate   # or your usual toolin
 pip install -r training/diffusion_policy/requirements.txt
 ```
 
+## Rotation conventions: two datasets, two conventions (easy to re-break -- read this)
+
+This repo has **two** sources of teleop/policy data with **different**
+action-rotation encodings. Mixing them up is exactly the bug that shipped
+once already (see below), so it's called out here instead of only in code
+comments.
+
+| dataset | action rotation dims (3 numbers) | how we know | consumers |
+|---|---|---|---|
+| `tools/roco2026_by_part` (sliced from the public HF dataset `rocochallenge2025/rocochallenge2026_Industrial_Assembly` by `tools/segment_by_part.py`) | **Euler XYZ, extrinsic** (`R = Rz(rz) @ Ry(ry) @ Rx(rx)`, scipy's lowercase `'xyz'`) | Empirically confirmed in `rotation_convention_audit.py`: for every frame of every part, decode the action's 3 rotation dims both as rotvec and as Euler XYZ, convert to a rotation matrix, and compare (geodesic degrees) against the *same frame's* state quaternion. Pooled across all 9 parts: rotvec decode gives median/mean/p90 = **1.0 / 16.1 / 60.9 deg**; Euler-XYZ-extrinsic decode gives **0.6 / 4.0 / 3.4 deg**. Small per-step rotations look similar under either convention (hence rotvec's deceptively small *median*); larger reorientations diverge sharply, which is what the *tail* (p90) exposes. | Everything in `training/diffusion_policy/` (this whole package trains only on this dataset) and `task/policies/diffusion_stateonly.py` + `task/policies/gt_replay.py` on the deployment side. |
+| self-collected `task/collect_lerobot_v3.py` / `collect_lerobot_v4.py` output | **rotvec (axis-angle)** | Stated directly in the dataset's own metadata: `"absolute_cartesian_target_xyz_rotvec_gripper"`. | `task/policies/act_eval_usb.py`, `act_eval_gear.py`, `act_eval.py` (trained on `training/build_gear_act_dataset.py`-merged versions of this data) -- their rotvec decode is correct, do not change it. |
+
+**The bug this caused:** `task/policies/diffusion_stateonly.py` (the
+state-only DP deployment adapter, trained on `roco2026_by_part`) decoded
+the action's rotation dims as rotvec via `Rotation.from_rotvec(...)`. Per
+the table above, that's wrong for this dataset. Most frames have small
+per-step rotation deltas where the two conventions happen to agree closely
+(hence the model still mostly "worked"), but on larger reorientations the
+decoded orientation was off by tens of degrees -- enough that Lula IK
+rejected the target pose, the controller held the last good command, and
+the part timed out with the arm frozen. `task/policies/gt_replay.py` (built
+to replay ground-truth actions and isolate control-stack bugs from
+policy-side bugs) had the *identical* decode bug, which would have made it
+look like a control-stack failure even on a perfect policy. Both are now
+fixed to decode Euler XYZ extrinsic (see `_euler_xyz_to_quat_wxyz` in each
+file). `evaluate.py` and `sanity_check.py`'s rotation error metric had the
+same rotvec assumption baked into `inference_utils.geodesic_angle_deg` --
+switched to the new `geodesic_angle_deg_euler_xyz`; expect *larger* reported
+angle errors after this fix (the old metric was undercounting real error
+in the same tail-heavy way, not just at deployment time), not smaller.
+
+**Two things this fix deliberately did NOT touch:** (1) `dataset.py`'s
+default training path (`rotation_repr="rotvec"`) regresses the 3 raw
+numbers verbatim with no geometric interpretation, so training itself was
+never affected -- only code that *interprets* those numbers as a rotation
+(deployment IK, error metrics) was wrong, which is also why no checkpoint
+needed retraining. (2) `policies/act_eval_usb.py` / `act_eval_gear.py` /
+`act_eval.py` and `collect_lerobot_v3.py`/`v4.py` -- confirmed true rotvec,
+left alone.
+
+**Still open / unverified:** `policies/diffusion_lerobot.py` and
+`policies/pi05_lerobot.py` also decode their action rotation as rotvec, but
+this repo has no record of which dataset their checkpoints were actually
+trained/fine-tuned on -- both are flagged in-file. Confirm before trusting
+either for a real deployment. `rotation_utils.py`'s `rotvec_to_rot6d` (used
+only by `dataset.py`'s never-yet-trained `rotation_repr="rot6d"` branch) is
+also wrong for `roco2026_by_part` as written -- fix it first if that branch
+is ever actually used.
+
 ## One-time setup (run once, not per part)
 
 ```bash
@@ -75,6 +124,8 @@ a copy of `norm_stats.json`, the part's `right_arm_constant` entry, and
 | `precheck_right_arm.py` | script: right-arm action std per part -> `right_arm_constants.json` |
 | `compute_norm_stats.py` | script: pooled 9-part normalizer -> `norm_stats.json` |
 | `train.py` | training loop (DDPM eps-prediction, masked MSE, EMA, checkpointing) |
+| `rotation_convention_audit.py` | script: empirically settles rotvec-vs-Euler-XYZ for `roco2026_by_part`'s action rotation dims (see "Rotation conventions" above) |
+| `check_deploy_consistency.py` | script: offline (no Isaac) dimension-by-dimension diff between `dataset.py`/`evaluate.py`'s state/action processing and `task/policies/diffusion_stateonly.py`'s adapter path -- catches the class of silent unit/convention bug this page documents |
 
 ## Design notes / known limits (carried over from the data exploration)
 
@@ -84,11 +135,17 @@ a copy of `norm_stats.json`, the part's `right_arm_constant` entry, and
   **absolute** Cartesian target, not a delta -- confirmed against the data
   (`action[t] ~= state_xyz[t+1]`, median error 1.3mm). The dataset does
   **no** frame differencing.
-- **Rotation conventions differ between state and action.** State
-  orientation is a unit quaternion (wxyz); action orientation is a
-  rotation vector that is *not* canonical-range (samples go up to 2.54*pi).
-  `rotation_utils.py` is the only place conversions should happen; the two
-  never share normalization stats.
+- **Rotation conventions differ between state and action, AND the action
+  convention differs between this repo's two datasets.** State orientation
+  is a unit quaternion (wxyz). Action orientation for
+  `tools/roco2026_by_part` (what this whole `training/diffusion_policy/`
+  package trains on) is **Euler XYZ extrinsic**, not a rotation vector --
+  see "Rotation conventions: two datasets, two conventions" below for the
+  full story and why this was gotten wrong for a while.
+  `rotation_utils.py` is rotvec-only (correct for the *other*,
+  self-collected dataset) and must not be applied to
+  `roco2026_by_part` action data without an explicit conversion; the two
+  representations never share normalization stats either way.
 - **Normalization**: state uses per-dim mean/std; action uses per-dim
   min/max from the pooled **q0.01/q0.99** quantiles (not raw min/max) so
   the ~1% of rotvec outliers don't compress everyone else's range, then

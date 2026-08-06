@@ -43,6 +43,13 @@ def _resize_rgb(img):
 
 
 def _rotvec_to_quat_wxyz(rx, ry, rz):
+    """UNVERIFIED rotation convention -- see the same caveat in
+    policies/diffusion_lerobot.py's _rotvec_to_quat_wxyz docstring. This
+    repo has two datasets with different action-rotation conventions
+    (self-collected v3/v4 = true rotvec; tools/roco2026_by_part = Euler XYZ
+    extrinsic, see training/diffusion_policy/rotation_convention_audit.py).
+    Confirm which one this PI05_CKPT was actually fine-tuned on before
+    trusting this decode."""
     from scipy.spatial.transform import Rotation
 
     x, y, z, w = Rotation.from_rotvec([rx, ry, rz]).as_quat()
