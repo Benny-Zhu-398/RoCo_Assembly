@@ -193,14 +193,20 @@ rotvec   解码:   p50=1.038°   p90=60.93°   mean=16.12°
 
 | 文件 | main（跑 DP） | pi05-remote-inference（跑 pi0.5） |
 |---|---|---|
-| `task/policies/pi05_lerobot.py` | 仍 `from_rotvec`（main 不跑 pi0.5） | ✓ `from_euler("xyz")` |
+| `task/policies/pi05_lerobot.py` | ✓ 已修（a6c437f） | ✓ `from_euler("xyz")` |
 | `task/policies/diffusion_stateonly.py` | ✓ 已修 | 仍 `from_rotvec`（本分支不跑 DP） |
 | `task/policies/gt_replay.py` | ✓ 已修 | 仍 `from_rotvec` |
 
-各分支在自己实际使用的那条路径上都是正确的。合并 main 还会触发
-1ed97bb「Delete unnecessary documents」对本分支若干文件的删除
+两个分支的 pi0.5 解码现在一致。DP 侧只在 main 上跑，本分支那两个文件
+未同步不影响任何实际运行的路径。合并 main 还会触发 1ed97bb
+「Delete unnecessary documents」对本分支若干文件的删除
 （`sanity_check.py`、`export_val_episodes.py`、`precheck_right_arm.py`
-等），更没有必要。
+等），没有必要。
+
+`task/policies/diffusion_lerobot.py`（LeRobot 版 DP adapter，与
+state-only 那个不同）在两个分支上都仍是 `from_rotvec` + 警告注释，
+c400fc9 也没有动它。如果之后要用它，需要先确认它的 checkpoint 训练在
+哪个数据集上。
 
 副作用（对两个 baseline 对称，不影响对比）：Euler 角在 ±π 处回绕不
 连续，上述日志里 1.5% 的相邻动作步跳变 > 45°，会略微增加回归难度。
