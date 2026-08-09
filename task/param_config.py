@@ -540,6 +540,22 @@ part_order = (
     "battery_size5",
 )
 
+# Eval-time subset. `ROCO_PART_ORDER="usb_a,hdmi"` restricts the run to those
+# parts, in the given order, without editing this file — needed because each
+# learned-policy checkpoint is trained on one part group, so a rollout must
+# only iterate the parts its checkpoint has seen. Unset (the default) leaves
+# the full sequence above untouched.
+_PART_ORDER_ENV = os.environ.get("ROCO_PART_ORDER", "").strip()
+if _PART_ORDER_ENV:
+    _requested = tuple(n.strip() for n in _PART_ORDER_ENV.split(",") if n.strip())
+    _unknown = [n for n in _requested if n not in part_order]
+    if _unknown:
+        raise ValueError(
+            f"ROCO_PART_ORDER names unknown part(s) {_unknown}; "
+            f"valid names are {list(part_order)}"
+        )
+    part_order = _requested
+
 # Parts already assembled on the board. Their
 # pick/place poses come from PART_CONFIG unchanged. Everything else is a
 # "swap" part: it spawns at given positions, gets picked from
