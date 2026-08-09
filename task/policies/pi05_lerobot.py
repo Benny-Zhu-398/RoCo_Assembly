@@ -30,6 +30,16 @@ _REMOTE_DEFAULTS = {
     "PI05_REMOTE_CUDA_VISIBLE_DEVICES": "2",
 }
 
+# Upper joint limit of the left gripper, in radians. Used ONLY to clamp a
+# commanded gripper target into the reachable range -- it is NOT a normalizer.
+# The dataset's state and action gripper dims are already raw joint radians
+# (working range ~0.06-0.30; the checkpoints' own quantile stats put state and
+# action on the same scale: q01 0.090, q50 0.099, q90 0.215), so dividing or
+# multiplying by this constant anywhere in the observation/action path puts the
+# policy off its training distribution. See the same conclusion, reached
+# independently from norm_stats.json, in policies/diffusion_stateonly.py's
+# GRIPPER UNITS docstring. The [0,1] open-ratio convention belongs to the
+# self-collected v3/v4 datasets that policies/diffusion_lerobot.py serves.
 GRIPPER_OPEN_LIMIT = 0.6649704
 _IMG_H, _IMG_W = 240, 320
 _SAFETY_MAX_TRANSLATION_M = 0.005
@@ -216,7 +226,7 @@ def _filter_left_action(action, current_position, current_quat_wxyz, current_gri
     if hold_reason is not None:
         filtered[:3] = current_position
         filtered[3:6] = current_rotation.as_euler("xyz")
-        filtered[6] = float(np.clip(current_gripper, 0.0, 1.0))
+        filtered[6] = float(np.clip(current_gripper, 0.0, GRIPPER_OPEN_LIMIT))
     else:
         translation_scale = min(
             1.0,
@@ -419,9 +429,6 @@ class Pi05LeRobotPolicy(Policy):
         else:
             Rp, Rq = np.zeros(3), np.array([1.0, 0.0, 0.0, 0.0])
 
-        def ratio(v):
-            return float(np.clip(v / GRIPPER_OPEN_LIMIT, 0, 1))
-
         return np.concatenate(
             [
                 np.asarray(Lp).reshape(-1)[:3],
@@ -432,8 +439,9 @@ class Pi05LeRobotPolicy(Policy):
                 q[self._Ri],
                 qd[self._Li],
                 qd[self._Ri],
-                [ratio(q[self._Lg])],
-                [ratio(q[self._Rg]) if self._Rg is not None else 0.0],
+                # Raw joint radians -- see the GRIPPER_OPEN_LIMIT note.
+                [float(q[self._Lg])],
+                [float(q[self._Rg]) if self._Rg is not None else 0.0],
             ]
         ).astype(np.float32)
 
@@ -715,12 +723,12 @@ class Pi05LeRobotPolicy(Policy):
                 filtered_action,
                 current_position,
                 current_quat,
-                float(obs.L_gripper_position) / GRIPPER_OPEN_LIMIT,
+                float(obs.L_gripper_position),
             )
 
         target_quat = _euler_xyz_to_quat_wxyz(*filtered_action[3:6])
         target_gripper = (
-            float(np.clip(filtered_action[6], 0.0, 1.0)) * GRIPPER_OPEN_LIMIT
+            float(np.clip(filtered_action[6], 0.0, GRIPPER_OPEN_LIMIT))
         )
         ik_action = self.L.forward(
             filtered_action[:3],
@@ -909,7 +917,7 @@ class Pi05LeRobotPolicy(Policy):
                 action,
                 current_position,
                 current_quat,
-                float(obs.L_gripper_position) / GRIPPER_OPEN_LIMIT,
+                float(obs.L_gripper_position),
             )
             self._log_cache(
                 f"safety control_step={self._control_step} held={int(safety['held'])} "
@@ -921,7 +929,7 @@ class Pi05LeRobotPolicy(Policy):
             )
         pos = action[:3]
         quat = _euler_xyz_to_quat_wxyz(action[3], action[4], action[5])
-        grip = float(np.clip(action[6], 0, 1)) * GRIPPER_OPEN_LIMIT
+        grip = float(np.clip(action[6], 0.0, GRIPPER_OPEN_LIMIT))
         control_action = self.L.forward(pos, quat, grip)
         if self._safety_filter:
             guarded_positions, joint_safety = _guard_left_joint_action(
