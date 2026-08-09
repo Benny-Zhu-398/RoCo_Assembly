@@ -104,7 +104,8 @@ while True:
     msg = _read()
     if msg is None:
         break
-    if msg.get("cmd") == "reset":
+    command = msg.get("cmd")
+    if command == "reset":
         queue_before, queue_maxlen = _queue_state()
         policy.reset()
         queued_actions_remaining = 0
@@ -117,7 +118,7 @@ while True:
         _write({"ok": True})
         continue
 
-    if msg.get("cmd") == "next_action":
+    if command == "next_action":
         request_index += 1
         queue_before, queue_maxlen = _queue_state()
         if queue_before is None or queue_before <= 0:
@@ -152,6 +153,10 @@ while True:
         _write({"ok": True, "action": action_np.tolist()})
         continue
 
+    if command not in (None, "observation", "replan"):
+        _write({"ok": False, "error": f"unknown command: {command!r}"})
+        continue
+
     try:
         exec_horizon = int(msg.get("exec_horizon", 1))
     except (TypeError, ValueError):
@@ -167,12 +172,12 @@ while True:
         )
         continue
 
-    discarded_actions = 0
-    if exec_horizon > 1:
-        queue_before_replan, _ = _queue_state()
-        discarded_actions = queue_before_replan or 0
-        policy.reset()
-        queued_actions_remaining = 0
+    # A full observation is always a closed-loop replan. Only next_action is
+    # allowed to consume an existing queue without images/state.
+    queue_before_replan, _ = _queue_state()
+    discarded_actions = queue_before_replan or 0
+    policy.reset()
+    queued_actions_remaining = 0
 
     obs = {
         "observation.state": torch.as_tensor(msg["state"], dtype=torch.float32),
@@ -222,7 +227,8 @@ while True:
         action_chunk.append(_action_to_numpy(queued_action))
     queue_after_chunk, _ = _queue_state()
     sys.stderr.write(
-        f"[pi05_server] request={request_index} cmd=observation "
+        f"[pi05_server] request={request_index} cmd=replan "
+        f"queue_before_replan={queue_before_replan} "
         f"queue_before={queue_before} queue_after={queue_after} "
         f"queue_maxlen={queue_maxlen} preprocessor_ms={preprocessor_ms:.3f} "
         f"select_action_ms={select_action_ms:.3f} "
