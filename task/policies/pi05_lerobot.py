@@ -42,17 +42,36 @@ def _resize_rgb(img):
         return out[:_IMG_H, :_IMG_W].astype(np.uint8)
 
 
-def _rotvec_to_quat_wxyz(rx, ry, rz):
-    """UNVERIFIED rotation convention -- see the same caveat in
-    policies/diffusion_lerobot.py's _rotvec_to_quat_wxyz docstring. This
-    repo has two datasets with different action-rotation conventions
-    (self-collected v3/v4 = true rotvec; tools/roco2026_by_part = Euler XYZ
-    extrinsic, see training/diffusion_policy/rotation_convention_audit.py).
-    Confirm which one this PI05_CKPT was actually fine-tuned on before
-    trusting this decode."""
+def _euler_xyz_to_quat_wxyz(rx, ry, rz):
+    """Euler XYZ EXTRINSIC angles -> wxyz quat -- NOT axis-angle/rotvec.
+
+    The pi0.5 checkpoints are fine-tuned on tools/roco2026_by_part, sliced
+    from rocochallenge2025/rocochallenge2026_Industrial_Assembly, whose
+    action rotation dims are Euler XYZ extrinsic despite the
+    "left_ee_rx/ry/rz" column names. Measured over that dataset's 121454
+    frames, as geodesic distance from each decode to the same frame's state
+    quaternion:
+
+        Euler XYZ decode:  p50=0.605 deg  p90= 3.40 deg  mean= 3.98 deg
+        rotvec   decode:   p50=1.038 deg  p90=60.93 deg  mean=16.12 deg
+
+    Independently: the raw rotation triple's norm has median exactly pi with
+    83% of frames above pi (max 7.98). A rotation vector's norm is its
+    rotation angle and cannot exceed pi, so the triple is not axis-angle.
+
+    Small per-step rotations look alike under either convention -- hence the
+    deceptively small median for the wrong decode -- but large reorientations
+    diverge by tens of degrees, enough for Lula IK to reject the target pose
+    and freeze the arm until the per-part timeout.
+
+    Do NOT reuse this for the self-collected collect_lerobot_v3.py/v4.py
+    datasets ("absolute_cartesian_target_xyz_rotvec_gripper"), which really
+    are rotvec -- policies/act_eval_usb.py and act_eval_gear.py decode those
+    correctly and must stay as they are.
+    """
     from scipy.spatial.transform import Rotation
 
-    x, y, z, w = Rotation.from_rotvec([rx, ry, rz]).as_quat()
+    x, y, z, w = Rotation.from_euler("xyz", [rx, ry, rz]).as_quat()
     return np.array([w, x, y, z], dtype=np.float64)
 
 
@@ -201,7 +220,7 @@ class Pi05LeRobotPolicy(Policy):
         if not np.isfinite(action[:7]).all():
             raise RuntimeError(f"pi0.5 action contains non-finite values: {action[:7]}")
         pos = action[:3]
-        quat = _rotvec_to_quat_wxyz(action[3], action[4], action[5])
+        quat = _euler_xyz_to_quat_wxyz(action[3], action[4], action[5])
         grip = float(np.clip(action[6], 0, 1)) * GRIPPER_OPEN_LIMIT
         return self.L.forward(pos, quat, grip)
 
