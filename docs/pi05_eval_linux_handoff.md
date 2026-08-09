@@ -163,6 +163,48 @@ cherry-pick。
 是有意的修复、仓库版是旧的。**正式跑之前应该把仓库同步到服务器那份**，
 并在结果里记录用的是哪个 commit，否则复现不了。
 
+## 旋转表示：本分支的 pi0.5 路径已验证正确
+
+数据集的 action 旋转三维是 **Euler XYZ extrinsic**，不是 rotvec/轴角
+（尽管列名叫 `left_ee_rx/ry/rz`）。仓库自采的 `collect_lerobot_v3.py/
+v4.py` 数据集才是真 rotvec，两者不能混用同一个解码器 ——
+`act_eval_usb.py` / `act_eval_gear.py` 用的 rotvec 是**正确**的，
+不要跟着改。
+
+在 pi0.5 实际训练用的那份数据（200 episodes / 121454 帧）上的实测
+（`$PI05_ROOT/logs/diagnose_pi05_rotation_representation_20260802_201700.log`，
+两种解码各自与同帧 state 四元数的测地距离）：
+
+```
+Euler XYZ 解码:   p50=0.605°   p90= 3.40°   mean= 3.98°
+rotvec   解码:   p50=1.038°   p90=60.93°   mean=16.12°
+```
+
+另一个独立证据：`raw_action_rotation_norm_rad` 的 p50 恰好是 π，且 83%
+的帧模长 > π（最大 7.98）。若这三维是旋转向量，模长即旋转角，必须在
+[0, π] 内 —— 作为轴角表示不成立。
+
+**结论：已训练的 pi0.5 checkpoint 不受影响。** 这个 bug 只存在于部署时
+的解码环节，训练阶段模型只是回归数据里的原始数值，与约定无关。本分支
+`task/policies/pi05_lerobot.py` 用 `from_euler("xyz")` 解码，与数据一致，
+不需要重训。
+
+分支分工（有意为之，不要合并）：
+
+| 文件 | main（跑 DP） | pi05-remote-inference（跑 pi0.5） |
+|---|---|---|
+| `task/policies/pi05_lerobot.py` | 仍 `from_rotvec`（main 不跑 pi0.5） | ✓ `from_euler("xyz")` |
+| `task/policies/diffusion_stateonly.py` | ✓ 已修 | 仍 `from_rotvec`（本分支不跑 DP） |
+| `task/policies/gt_replay.py` | ✓ 已修 | 仍 `from_rotvec` |
+
+各分支在自己实际使用的那条路径上都是正确的。合并 main 还会触发
+1ed97bb「Delete unnecessary documents」对本分支若干文件的删除
+（`sanity_check.py`、`export_val_episodes.py`、`precheck_right_arm.py`
+等），更没有必要。
+
+副作用（对两个 baseline 对称，不影响对比）：Euler 角在 ±π 处回绕不
+连续，上述日志里 1.5% 的相邻动作步跳变 > 45°，会略微增加回归难度。
+
 ## 本机遗留物（可清理）
 
 - conda 环境 `py311`（约 18 GB，Isaac Sim 5.1 Windows 版）—— 驱动问题没解决
