@@ -1,0 +1,125 @@
+{
+  "metadata": {
+    "completion_reason": "complete",
+    "current_part": null,
+    "completed_parts": 9,
+    "total_task_steps": 566,
+    "sim_time_s": 56.81,
+    "max_steps": null,
+    "max_sim_seconds": null,
+    "max_parts": null,
+    "snap_fired_parts": [
+      "hdmi",
+      "pin",
+      "usb_a"
+    ]
+  },
+  "pos_tol_m": 0.01,
+  "n_pass": 6,
+  "n_fail": 3,
+  "n_missing": 0,
+  "per_part": [
+    {
+      "name": "gear_20teeth",
+      "release_mode": "open",
+      "measure": "meshT",
+      "pos_err_m": 0.18457109536534527,
+      "tolerance_m": 0.01,
+      "actual": [
+        0.1523539844931754,
+        0.08298886900481521,
+        1.0381843278630272
+      ],
+      "target": [
+        0.1972314984643313,
+        -0.09598882384960386,
+        1.033770322353139
+      ],
+      "pass": false
+    },
+    {
+      "name": "gear_60teeth",
+      "release_mode": "open",
+      "measure": "meshT",
+      "pos_err_m": 0.0018379501108664702,
+      "tolerance_m": 0.01,
+      "actual": [
+        0.2078334351578927,
+        -0.05588783698237264,
+        1.0332578347479617
+      ],
+      "target": [
+        0.20853747092278196,
+        -0.056146127605838425,
+        1.0315798358785877
+      ],
+      "pass": true
+    },
+    {
+      "name": "rod_16mm",
+      "release_mode": "snap",
+      "snap_fired": false,
+      "pass": false
+    },
+    {
+      "name": "bolt_8mm",
+      "release_mode": "snap",
+      "snap_fired": false,
+      "pass": false
+    },
+    {
+      "name": "usb_a",
+      "release_mode": "snap",
+      "snap_fired": true,
+      "pass": true
+    },
+    {
+      "name": "hdmi",
+      "release_mode": "snap",
+      "snap_fired": true,
+      "pass": true
+    },
+    {
+      "name": "pin",
+      "release_mode": "snap",
+      "snap_fired": true,
+      "pass": true
+    },
+    {
+      "name": "battery_size1",
+      "release_mode": "open",
+      "measure": "AABBmid",
+      "pos_err_m": 0.005619543070220349,
+      "tolerance_m": 0.01,
+      "actual": [
+        0.12986352470816928,
+        0.15567746158021098,
+        1.0515627005822892
+      ],
+      "target": [
+        0.12914,
+        0.15615,
+        1.04601
+      ],
+      "pass": true
+    },
+    {
+      "name": "battery_size5",
+      "release_mode": "open",
+      "measure": "AABBmid",
+      "pos_err_m": 0.007201090695089098,
+      "tolerance_m": 0.01,
+      "actual": [
+        0.08652543067145857,
+        0.16028391959840893,
+        1.034944981277597
+      ],
+      "target": [
+        0.08701,
+        0.16742,
+        1.03578
+      ],
+      "pass": true
+    }
+  ]
+}
