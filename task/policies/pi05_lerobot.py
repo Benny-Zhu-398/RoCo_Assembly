@@ -1,4 +1,30 @@
-"""Deploy a LeRobot Pi0.5 policy in the Isaac Sim harness."""
+"""Deploy a LeRobot Pi0.5 policy in the Isaac Sim harness.
+
+=== GRIPPER UNITS -- raw joint radians, NOT a [0,1] open-ratio ===
+
+Both the STATE and the ACTION gripper dims of the dataset these checkpoints are
+fine-tuned on are raw joint radians. Measured over all 121454 frames of
+tools/roco2026_by_part, `observation.state[42]` and `action[6]` (both
+left_gripper) have the same distribution:
+
+    p1 0.060   p50 0.1053   p99 0.3008   mean 0.146   (both columns)
+
+Identical means settle it: if the state were a ratio of the action's raw value
+over the 0.665 rad fully-open joint value, its mean would be ~0.22, not 0.146.
+(The state column's exact 0.0/1.0 min/max come from 24 outlier frames of
+121454, not from a [0,1] encoding.)
+
+An earlier version of this file divided the state gripper by a
+`GRIPPER_OPEN_LIMIT = 0.6649704` to send a ratio, and multiplied the predicted
+gripper back by the same constant -- so the state went in ~1.5x too large and
+the commanded opening came out 0.665x too small. That is the same bug
+policies/diffusion_stateonly.py already found and fixed for the DP checkpoint;
+see its "GRIPPER UNITS" docstring section. No rescale belongs anywhere in this
+file, in either direction.
+
+policies/diffusion_lerobot.py keeps the ratio convention on purpose -- it
+serves a checkpoint trained on a different export. Do not "fix" it to match.
+"""
 from __future__ import annotations
 
 import os
@@ -12,7 +38,6 @@ from policy_api import EnvInfo, Observation, PartTarget, Policy
 
 _TASK_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-GRIPPER_OPEN_LIMIT = 0.6649704
 _IMG_H, _IMG_W = 240, 320
 
 
@@ -186,10 +211,10 @@ class Pi05LeRobotPolicy(Policy):
         else:
             Rp, Rq = np.zeros(3), np.array([1.0, 0.0, 0.0, 0.0])
 
-        def ratio(v):
-            return float(np.clip(v / GRIPPER_OPEN_LIMIT, 0, 1))
-
-        return np.concatenate(
+        # Raw joint radians, not a ratio -- see the module docstring's GRIPPER
+        # UNITS note. Always sends all 44 dims: pi05_server.py slices this down
+        # to the 22-D left-arm layout itself when the checkpoint wants that.
+        full = np.concatenate(
             [
                 np.asarray(Lp).reshape(-1)[:3],
                 np.asarray(Lq).reshape(-1)[:4],
@@ -199,10 +224,12 @@ class Pi05LeRobotPolicy(Policy):
                 q[self._Ri],
                 qd[self._Li],
                 qd[self._Ri],
-                [ratio(q[self._Lg])],
-                [ratio(q[self._Rg]) if self._Rg is not None else 0.0],
+                [float(q[self._Lg])],
+                [float(q[self._Rg]) if self._Rg is not None else 0.0],
             ]
-        ).astype(np.float32)
+        )
+        assert full.shape == (44,), f"expected 44-D full state, got {full.shape}"
+        return full.astype(np.float32)
 
     def act(self, obs: Observation):
         self._send(
@@ -221,7 +248,7 @@ class Pi05LeRobotPolicy(Policy):
             raise RuntimeError(f"pi0.5 action contains non-finite values: {action[:7]}")
         pos = action[:3]
         quat = _euler_xyz_to_quat_wxyz(action[3], action[4], action[5])
-        grip = float(np.clip(action[6], 0, 1)) * GRIPPER_OPEN_LIMIT
+        grip = float(action[6])  # raw joint radians -- see module docstring's GRIPPER UNITS note
         return self.L.forward(pos, quat, grip)
 
     def is_done(self, obs: Observation) -> bool:
