@@ -9,9 +9,9 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
-from typing import Tuple
+from typing import Optional, Tuple
 
-from constants import ACTION_DIM, DATASET_DEFAULT_ROOT, NUM_PARTS, PART_ORDER, STATE_DIM
+from constants import ACTION_DIM, CAMERA_KEYS, DATASET_DEFAULT_ROOT, NUM_PARTS, PART_ORDER, STATE_DIM
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -27,6 +27,11 @@ class DataConfig:
     n_obs_steps: int = 1       # state-only single-timestep conditioning
     val_fraction: float = 0.1
     split_seed: int = 0        # must match the seed compute_norm_stats.py used
+    # Decode-time resize for images (H, W), only used when
+    # model.use_vision=True (see ModelConfig). None = keep native 240x320
+    # (several GB of RAM per part at that resolution -- see dataset.py's
+    # module docstring); shrink this if that's too much for the box.
+    image_resize_hw: Optional[Tuple[int, int]] = None
 
     def __post_init__(self) -> None:
         if self.part not in PART_ORDER:
@@ -64,6 +69,20 @@ class ModelConfig:
     down_dims: Tuple[int, ...] = (128, 256, 512)
     kernel_size: int = 5
     n_groups: int = 8
+
+    # --- vision (optional; default False = original state-only behavior,
+    # existing checkpoints/configs unaffected). See vision.py for the
+    # encoder these fields configure and CAMERA_KEYS for which two cameras.
+    # When True, dataset.py must be built with load_images=True (train.py
+    # wires this automatically off this same flag -- see build_dataloaders).
+    use_vision: bool = False
+    camera_keys: Tuple[str, ...] = CAMERA_KEYS
+    vision_backbone: str = "resnet18"
+    vision_pretrained: bool = True
+    vision_use_group_norm: bool = False  # must be False when vision_pretrained=True, see vision.py::RgbEncoder
+    vision_num_keypoints: int = 32
+    vision_crop_hw: Optional[Tuple[int, int]] = None
+    vision_crop_is_random: bool = True
 
     @property
     def action_dim(self) -> int:
@@ -123,10 +142,19 @@ class ExperimentConfig:
 
     @classmethod
     def from_dict(cls, d: dict) -> "ExperimentConfig":
+        data_d = dict(d.get("data", {}))
+        if data_d.get("image_resize_hw") is not None:
+            data_d["image_resize_hw"] = tuple(data_d["image_resize_hw"])
+
+        model_d = dict(d.get("model", {}))
+        model_d["down_dims"] = tuple(model_d.get("down_dims", (128, 256, 512)))
+        model_d["camera_keys"] = tuple(model_d.get("camera_keys", CAMERA_KEYS))
+        if model_d.get("vision_crop_hw") is not None:
+            model_d["vision_crop_hw"] = tuple(model_d["vision_crop_hw"])
+
         return cls(
-            data=DataConfig(**d.get("data", {})),
-            #model=ModelConfig(**{**d.get("model", {}), "down_dims": tuple(d.get("model", {}).get("down_dims", (256, 512, 1024)))}),
-            model=ModelConfig(**{**d.get("model", {}), "down_dims": tuple(d.get("model", {}).get("down_dims", (128, 256, 512)))}),
+            data=DataConfig(**data_d),
+            model=ModelConfig(**model_d),
             diffusion=DiffusionConfig(**d.get("diffusion", {})),
             train=TrainConfig(**d.get("train", {})),
         )

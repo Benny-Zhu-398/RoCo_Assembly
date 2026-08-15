@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import torch
@@ -38,7 +38,8 @@ def build_model_from_checkpoint(
     and load either the EMA shadow weights (default, standard DP inference
     recipe) or the raw optimizer-iterate weights."""
     cfg = ExperimentConfig.from_dict(ckpt["config"])
-    model = DiffusionPolicyNet(cfg.model).to(device)
+    vision_image_hw = cfg.data.image_resize_hw or (240, 320)
+    model = DiffusionPolicyNet(cfg.model, vision_image_hw=vision_image_hw).to(device)
 
     state_dict = None
     if use_ema:
@@ -81,6 +82,7 @@ def ddim_sample(
     num_inference_steps: int,
     device: torch.device,
     generator: Optional[torch.Generator] = None,
+    images: Optional[Dict[str, torch.Tensor]] = None,
 ) -> torch.Tensor:
     """Deterministic (eta=0) DDIM sampling. Returns normalized actions,
     shape (B, horizon, action_dim) -- caller unnormalizes.
@@ -122,7 +124,7 @@ def ddim_sample(
     scheduler.set_timesteps(num_inference_steps, device=device)
 
     B = state.shape[0]
-    global_cond = model.global_cond(state, task_idx)
+    global_cond = model.global_cond(state, task_idx, images)
     trajectory = torch.randn((B, horizon, action_dim), generator=generator, device=device)
 
     for t in scheduler.timesteps:

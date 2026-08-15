@@ -9,9 +9,12 @@ __pycache__/
 # type checker
 .ty/
 
+.claude/
+
 # logs / run outputs
 logs/
 outputs/
+outputs_vision/
 artifacts/
 task/*_server.log
 

@@ -3,6 +3,7 @@
 # Install these in a separate venv, same pattern as the DP eval sidecar
 # (task/dp_server.py) already uses.
 torch>=2.2
+torchvision
 diffusers>=0.27
 numpy
 pandas

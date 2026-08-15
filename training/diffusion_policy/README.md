@@ -149,7 +149,21 @@ a copy of `norm_stats.json`, the part's `right_arm_constant` entry, and
 - **Normalization**: state uses per-dim mean/std; action uses per-dim
   min/max from the pooled **q0.01/q0.99** quantiles (not raw min/max) so
   the ~1% of rotvec outliers don't compress everyone else's range, then
-  clips to [-1, 1].
+  clips to [-1, 1]. **Exception: the gripper dim (`ACTION_GRIPPER_IDX`) is
+  normalized PER-PART, not pooled.** `param_config.py`'s hand-tuned
+  `gripper_open`/`gripper_close` targets vary a lot by part (e.g.
+  `gear_20teeth`'s actual q0.01/q0.99 action range is only 0.083 rad wide,
+  vs. `rod_16mm`'s 0.241 rad), so a single pooled span gave narrow-range
+  parts far less usable normalized resolution for open/close than
+  wide-range parts got -- diagnosed while triaging gripper-closure-failure
+  rollouts on bolt/usb/hdmi/pin/rod (2026-08-11). `NormStats` now carries
+  `gripper_action_min/max: Dict[part, float]` alongside the pooled
+  `action_min/max`, and `normalize_action`/`unnormalize_action` take a
+  required `part` argument to look up the override. **All checkpoints
+  trained before this fix (`compute_norm_stats.py` predates the per-part
+  gripper stats) must be retrained** -- their `norm_stats.json` snapshot
+  has no `gripper_action_min/max` and their weights were fit against the
+  old pooled gripper scale.
 - **`rotation_repr="rot6d"`** is wired through `config.py` / `dataset.py` /
   `model.py` (action dim becomes 10) but is *not* the default and hasn't
   been trained end-to-end -- treat it as a reserved branch for a later

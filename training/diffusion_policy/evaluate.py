@@ -21,10 +21,12 @@ All error metrics are reported in unnormalized physical units:
     near the pi-magnitude rotvec jump documented in rotation_utils.py)
   - gripper: continuous error in the action's native (unnormalized) units,
     plus accuracy after snapping both prediction and GT to the nearest of
-    11 evenly-spaced levels spanning the pooled-training gripper range
-    (norm_stats action_min/max) -- there is no discrete gripper-detent
-    definition elsewhere in this repo, so this bucketing is evaluate.py's
-    own convention, not derived from hardware.
+    11 evenly-spaced levels spanning THIS PART's own gripper action range
+    (norm_stats gripper_action_min/max[part], per-part, not pooled -- see
+    normalization.py's NormStats docstring for why pooling this dim across
+    parts was a bug) -- there is no discrete gripper-detent definition
+    elsewhere in this repo, so this bucketing is evaluate.py's own
+    convention, not derived from hardware.
 Metrics (a)/(b) are also broken out per action-chunk timestep, to see how
 error grows with prediction horizon (informs n_action_steps for the
 execution-time policy).
@@ -126,6 +128,9 @@ def run_eval(
         val_fraction=cfg.data.val_fraction,
         split_seed=cfg.data.split_seed,
         rotation_repr=cfg.model.rotation_repr,
+        load_images=cfg.model.use_vision,
+        camera_keys=cfg.model.camera_keys,
+        image_resize_hw=cfg.data.image_resize_hw,
     )
     if len(val_ds) == 0:
         raise RuntimeError(f"val split for part={part!r} is empty (val_fraction={cfg.data.val_fraction})")
@@ -149,6 +154,10 @@ def run_eval(
         action_n_gt = batch["action"].to(device)
         is_pad = batch["action_is_pad"].numpy()
         task_idx = torch.full((state.shape[0],), part_to_idx[part], dtype=torch.long, device=device)
+        images = (
+            {cam: batch[f"image_{cam}"].to(device) for cam in cfg.model.camera_keys}
+            if cfg.model.use_vision else None
+        )
 
         action_n_pred = ddim_sample(
             model, state, task_idx, horizon, action_dim,
@@ -159,10 +168,11 @@ def run_eval(
             num_inference_steps=num_inference_steps,
             device=device,
             generator=gen,
+            images=images,
         )
 
-        pred = unnormalize_action(action_n_pred.cpu().numpy(), norm_stats)
-        gt = unnormalize_action(action_n_gt.cpu().numpy(), norm_stats)
+        pred = unnormalize_action(action_n_pred.cpu().numpy(), norm_stats, part)
+        gt = unnormalize_action(action_n_gt.cpu().numpy(), norm_stats, part)
 
         pred_xyz_all.append(pred[..., ACTION_XYZ_SLICE])
         gt_xyz_all.append(gt[..., ACTION_XYZ_SLICE])
@@ -193,7 +203,7 @@ def run_eval(
     gripper_err = np.abs(pred_gripper - gt_gripper)
 
     gripper_levels = np.linspace(
-        norm_stats.action_min[ACTION_GRIPPER_IDX], norm_stats.action_max[ACTION_GRIPPER_IDX], N_GRIPPER_LEVELS,
+        norm_stats.gripper_action_min[part], norm_stats.gripper_action_max[part], N_GRIPPER_LEVELS,
     )
     pred_bin = np.argmin(np.abs(pred_gripper[..., None] - gripper_levels[None, None, :]), axis=-1)
     gt_bin = np.argmin(np.abs(gt_gripper[..., None] - gripper_levels[None, None, :]), axis=-1)

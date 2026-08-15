@@ -23,7 +23,7 @@ import json
 import sys
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 import numpy as np
 import torch
@@ -79,6 +79,9 @@ def build_dataloaders(cfg: ExperimentConfig, norm_stats: NormStats):
         val_fraction=cfg.data.val_fraction,
         split_seed=cfg.data.split_seed,
         rotation_repr=cfg.model.rotation_repr,
+        load_images=cfg.model.use_vision,
+        camera_keys=cfg.model.camera_keys,
+        image_resize_hw=cfg.data.image_resize_hw,
     )
     train_ds = PartSequenceDataset(split="train", **common)
     val_ds = PartSequenceDataset(split="val", **common)
@@ -93,7 +96,16 @@ def build_dataloaders(cfg: ExperimentConfig, norm_stats: NormStats):
     return train_ds, val_ds, train_loader, val_loader
 
 
-def train(cfg: ExperimentConfig) -> Path:
+def _extract_images(batch: dict, camera_keys, device) -> Optional[dict]:
+    """batch -> {camera_key: (B,3,H,W) tensor on device}, or None if the
+    batch has no image_* keys (use_vision=False -- dataset.py only adds
+    them when built with load_images=True, see PartSequenceDataset)."""
+    if not camera_keys or f"image_{camera_keys[0]}" not in batch:
+        return None
+    return {cam: batch[f"image_{cam}"].to(device) for cam in camera_keys}
+
+
+def train(cfg: ExperimentConfig, resume_from: Optional[str] = None) -> Path:
     from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 
     torch.manual_seed(cfg.train.seed)
@@ -135,8 +147,27 @@ def train(cfg: ExperimentConfig) -> Path:
         print(f"[train] {len(train_ds.rotvec_jump_warnings)} rotvec-jump warning(s) in train split: "
               f"{train_ds.rotvec_jump_warnings}")
 
-    model = DiffusionPolicyNet(cfg.model).to(device)
+    vision_image_hw = cfg.data.image_resize_hw or (240, 320)
+    model = DiffusionPolicyNet(cfg.model, vision_image_hw=vision_image_hw).to(device)
     ema = EMA(model, cfg.train.ema_decay) if cfg.train.use_ema else None
+
+    start_epoch = 0
+    if resume_from is not None:
+        resume_path = resolve_repo_path(resume_from)
+        resume_ckpt = torch.load(resume_path, map_location=device, weights_only=False)
+        if resume_ckpt["part"] != cfg.data.part:
+            raise ValueError(
+                f"--resume-from {resume_path} was trained for part={resume_ckpt['part']!r}, "
+                f"not --part {cfg.data.part!r}"
+            )
+        model.load_state_dict(resume_ckpt["model_state_dict"])
+        if ema is not None and resume_ckpt.get("ema_state_dict") is not None:
+            ema.shadow.load_state_dict(resume_ckpt["ema_state_dict"])
+        start_epoch = resume_ckpt["epoch"]
+        print(f"[train] resumed from {resume_path} at epoch={start_epoch} "
+              f"(model + EMA weights restored; optimizer state is NOT -- AdamW momentum restarts "
+              "from zero, and the cosine LR schedule is fast-forwarded by step count, not restored "
+              "from a saved scheduler state)")
 
     noise_scheduler = DDPMScheduler(
         num_train_timesteps=cfg.diffusion.num_train_timesteps,
@@ -148,14 +179,17 @@ def train(cfg: ExperimentConfig) -> Path:
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.train.lr, weight_decay=cfg.train.weight_decay)
     n_steps = cfg.train.num_epochs * max(len(train_loader), 1)
     lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(n_steps, 1))
+    start_step = start_epoch * max(len(train_loader), 1)
+    for _ in range(start_step):  # fast-forward to where the LR schedule left off
+        lr_scheduler.step()
 
     ckpt_dir = resolve_repo_path(cfg.train.ckpt_dir) / cfg.data.part
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     cfg.save(ckpt_dir / "config.json")
 
-    global_step = 0
+    global_step = start_step
     t0 = time.time()
-    for epoch in range(cfg.train.num_epochs):
+    for epoch in range(start_epoch, cfg.train.num_epochs):
         model.train()
         epoch_loss = 0.0
         n_batches = 0
@@ -164,6 +198,7 @@ def train(cfg: ExperimentConfig) -> Path:
             action = batch["action"].to(device)
             is_pad = batch["action_is_pad"].to(device)
             task_idx = batch["task_idx"].to(device)
+            images = _extract_images(batch, cfg.model.camera_keys, device)
 
             noise = torch.randn_like(action)
             timesteps = torch.randint(
@@ -171,7 +206,7 @@ def train(cfg: ExperimentConfig) -> Path:
             ).long()
             noisy_action = noise_scheduler.add_noise(action, noise, timesteps)
 
-            eps_pred = model(noisy_action, timesteps, state, task_idx)
+            eps_pred = model(noisy_action, timesteps, state, task_idx, images)
             loss = masked_mse(eps_pred, noise, is_pad)
 
             optimizer.zero_grad(set_to_none=True)
@@ -194,7 +229,8 @@ def train(cfg: ExperimentConfig) -> Path:
         print(f"[train] === epoch {epoch} done: mean_train_loss={mean_loss:.5f} ===")
 
         if (epoch + 1) % cfg.train.val_every_epochs == 0 or epoch == cfg.train.num_epochs - 1:
-            val_loss = evaluate(model, val_loader, noise_scheduler, device, seed=cfg.train.seed)
+            val_loss = evaluate(model, val_loader, noise_scheduler, device, seed=cfg.train.seed,
+                                 camera_keys=cfg.model.camera_keys)
             print(f"[train] === epoch {epoch} val_loss={val_loss:.5f} ===")
 
         if (epoch + 1) % cfg.train.ckpt_every_epochs == 0 or epoch == cfg.train.num_epochs - 1:
@@ -207,7 +243,7 @@ def train(cfg: ExperimentConfig) -> Path:
 
 
 @torch.no_grad()
-def evaluate(model, val_loader, noise_scheduler, device, seed: int) -> float:
+def evaluate(model, val_loader, noise_scheduler, device, seed: int, camera_keys=()) -> float:
     if len(val_loader.dataset) == 0:
         return float("nan")
     model.eval()
@@ -218,13 +254,14 @@ def evaluate(model, val_loader, noise_scheduler, device, seed: int) -> float:
         action = batch["action"].to(device)
         is_pad = batch["action_is_pad"].to(device)
         task_idx = batch["task_idx"].to(device)
+        images = _extract_images(batch, camera_keys, device)
 
         noise = torch.randn(action.shape, generator=g).to(device)
         timesteps = torch.randint(
             0, noise_scheduler.config.num_train_timesteps, (action.shape[0],), generator=g,
         ).to(device).long()
         noisy_action = noise_scheduler.add_noise(action, noise, timesteps)
-        eps_pred = model(noisy_action, timesteps, state, task_idx)
+        eps_pred = model(noisy_action, timesteps, state, task_idx, images)
         loss = masked_mse(eps_pred, noise, is_pad)
         total += loss.item() * action.shape[0]
         n += action.shape[0]
@@ -247,7 +284,7 @@ def save_checkpoint(path: Path, model, ema: Optional[EMA], cfg: ExperimentConfig
     torch.save(payload, path)
 
 
-def parse_args() -> ExperimentConfig:
+def parse_args() -> Tuple[ExperimentConfig, Optional[str]]:
     ap = argparse.ArgumentParser()
     ap.add_argument("--part", type=str, required=True, choices=list(PART_TO_IDX.keys()))
     ap.add_argument("--config", type=str, default=None, help="path to a saved ExperimentConfig json")
@@ -258,6 +295,27 @@ def parse_args() -> ExperimentConfig:
     ap.add_argument("--device", type=str, default=None)
     ap.add_argument("--rotation-repr", type=str, default=None, choices=["rotvec", "rot6d"])
     ap.add_argument("--no-ema", action="store_true")
+    ap.add_argument("--use-vision", action="store_true", help="add head+left_hand camera conditioning (see vision.py)")
+    ap.add_argument("--image-resize", type=str, default=None,
+                     help="decode-time image resize as 'H,W' (default: native 240x320 -- several GB RAM/part, see dataset.py)")
+    ap.add_argument("--num-workers", type=int, default=None,
+                     help="DataLoader worker processes (default: 4, or 0 when --use-vision is set "
+                          "and --num-workers isn't -- Windows' spawn-based multiprocessing has to "
+                          "pickle the WHOLE dataset (incl. the multi-GB in-memory image cache) to "
+                          "every worker, which is slow at best and crashes at worst; images are "
+                          "already fully preloaded so __getitem__ is cheap indexing anyway, workers "
+                          "buy little here)")
+    ap.add_argument("--ckpt-dir", type=str, default=None,
+                     help="override output dir (default: training/diffusion_policy/outputs, or "
+                          ".../outputs_vision when --use-vision is set and --ckpt-dir isn't -- "
+                          "kept separate so a vision run never overwrites a state-only checkpoint "
+                          "for the same part, or vice versa)")
+    ap.add_argument("--resume-from", type=str, default=None,
+                     help="path to a .pt checkpoint (e.g. outputs_vision/hdmi/epoch_0100.pt) to "
+                          "resume model+EMA weights from; training continues at that checkpoint's "
+                          "epoch count through --num-epochs. Optimizer state is NOT restored (see "
+                          "train()'s resume_from branch) -- Adam momentum restarts, LR schedule "
+                          "position is recomputed to match, not reloaded.")
     args = ap.parse_args()
 
     cfg = ExperimentConfig.load(args.config) if args.config else ExperimentConfig()
@@ -276,10 +334,24 @@ def parse_args() -> ExperimentConfig:
         cfg.model.rotation_repr = args.rotation_repr
     if args.no_ema:
         cfg.train.use_ema = False
+    if args.use_vision:
+        cfg.model.use_vision = True
+    if args.image_resize is not None:
+        h, w = (int(x) for x in args.image_resize.split(","))
+        cfg.data.image_resize_hw = (h, w)
+    if args.ckpt_dir is not None:
+        cfg.train.ckpt_dir = args.ckpt_dir
+    elif cfg.model.use_vision:
+        cfg.train.ckpt_dir = "training/diffusion_policy/outputs_vision"
+    if args.num_workers is not None:
+        cfg.train.num_workers = args.num_workers
+    elif cfg.model.use_vision:
+        cfg.train.num_workers = 0
     cfg.data.__post_init__()
     cfg.model.__post_init__()
-    return cfg
+    return cfg, args.resume_from
 
 
 if __name__ == "__main__":
-    train(parse_args())
+    _cfg, _resume_from = parse_args()
+    train(_cfg, resume_from=_resume_from)

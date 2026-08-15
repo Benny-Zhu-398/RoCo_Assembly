@@ -118,3 +118,14 @@ ACTION_GRIPPER_IDX = 6
 
 DATASET_FPS = 10.0
 DATASET_DEFAULT_ROOT = "tools/roco2026_by_part"
+
+# --- vision (optional -- see vision.py / model.py's use_vision path) ---
+# The two camera streams the vision-conditioned policy consumes, out of the
+# three tools/roco2026_by_part actually has (observation.images.{head,
+# left_hand,right_hand}). right_hand is deliberately excluded: the right
+# arm never moves in this dataset (see LEFT_STATE_IDX above), so a camera
+# rigidly mounted to it is a second static, low-information viewpoint, not
+# worth doubling vision-encoder compute for. Defined here (not in vision.py)
+# so config.py can reference it without importing torch/torchvision --
+# vision.py imports it from here instead of defining it.
+CAMERA_KEYS = ("head", "left_hand")

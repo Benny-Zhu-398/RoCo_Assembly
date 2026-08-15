@@ -1,33 +1,35 @@
-"""Inference server for this repo's own state-only Diffusion Policy
-(training/diffusion_policy/{model.py,train.py}), NOT lerobot's DiffusionPolicy
-(see dp_server.py for that one).
-
-Runs in the training venv (torch + diffusers, no Isaac/omni, no lerobot --
-see training/diffusion_policy/requirements.txt) so the Isaac-side harness
-process never has to import torch. Same length-prefixed pickle-over-stdio
-protocol as dp_server.py, but the message shapes are different:
+"""Inference server for this repo's own VISION-conditioned Diffusion Policy
+(training/diffusion_policy/{model.py,vision.py,train.py} with
+cfg.model.use_vision=True), NOT lerobot's DiffusionPolicy (see dp_server.py
+for that one) and NOT the state-only variant (see dp_server_stateonly.py --
+this file is its head+left_hand-camera sibling, same process-isolation
+pattern, same length-prefixed pickle-over-stdio protocol, different message
+shape).
 
 Message in : {"cmd": "reset"} OR
-              {"state": (22,) f32}   -- ALREADY left-arm-sliced, RAW units
-                                        (not normalized -- this server
-                                        normalizes with the checkpoint's own
-                                        norm_stats, never recomputed)
+              {"state": (22,) f32,          -- ALREADY left-arm-sliced, RAW
+                                                units (not normalized)
+               "images": {"head": (H,W,3) uint8, "left_hand": (H,W,3) uint8}}
+                                             -- RAW camera resolution is fine;
+                                                this server resizes to match
+                                                the checkpoint's own training-
+                                                time resolution
+                                                (cfg.data.image_resize_hw or
+                                                native 240x320) before the
+                                                model ever sees them.
 Message out: {"ok": True} OR
               {"action_horizon": (horizon, 7) f32 list-of-lists}  -- RAW
-              (unnormalized) units: xyz(3) + rotvec(3) + gripper(1).
-              Caller (diffusion_stateonly.py) picks how many of the horizon
-              steps to actually execute (n_action_steps) before re-querying;
-              this server always returns the *full* predicted horizon so
-              that knob is free to sweep on the Isaac side with no server
-              restart.
+              (unnormalized) units: xyz(3) + euler-xyz(3) + gripper(1) --
+              see task/policies/diffusion_vision.py's ACTION ROTATION
+              CONVENTION note for why this is Euler XYZ, not rotvec, despite
+              the column names.
 
 Usage:
-    python dp_server_stateonly.py <ckpt_path> [--num-inference-steps N] [--no-ema] [--seed S]
+    python dp_server_vision.py <ckpt_path> [--num-inference-steps N] [--no-ema] [--seed S]
 
-`--num-inference-steps` overrides the checkpoint's own diffusion config
-(mirrors evaluate.py's --num-inference-steps) so the num_inference_steps
-sweep (16 -> 50 -> 100) needs no code change, just a different server launch
-arg from diffusion_stateonly.py's DP_NUM_INFERENCE_STEPS env var.
+Refuses to load a checkpoint trained with cfg.model.use_vision=False --
+that's what dp_server_stateonly.py is for, and a state-only checkpoint has
+no vision_encoder weights to run images through.
 """
 from __future__ import annotations
 
@@ -88,6 +90,17 @@ def _write(out, obj):
     out.flush()
 
 
+def _prep_image(img_hwc_uint8: np.ndarray, target_hw, device) -> torch.Tensor:
+    """(H,W,3) uint8, any resolution -> (1,3,target_h,target_w) float32 in
+    [0,1] on device. Resize path matches dataset.py's _resize_rgb (torchvision,
+    antialiased) so train/deploy preprocessing agree."""
+    t = torch.from_numpy(np.ascontiguousarray(img_hwc_uint8)).permute(2, 0, 1).float() / 255.0
+    if (t.shape[1], t.shape[2]) != tuple(target_hw):
+        import torchvision.transforms.functional as TF
+        t = TF.resize(t, list(target_hw), antialias=True)
+    return t.unsqueeze(0).to(device)
+
+
 def main():
     args = _parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -95,6 +108,11 @@ def main():
     ckpt = load_checkpoint(args.ckpt)
     part = ckpt["part"]
     model, cfg = build_model_from_checkpoint(ckpt, device, use_ema=not args.no_ema)
+    if not cfg.model.use_vision:
+        raise ValueError(
+            f"{args.ckpt} was trained with use_vision=False -- this is a state-only "
+            "checkpoint, use dp_server_stateonly.py instead."
+        )
     if cfg.model.rotation_repr != "rotvec":
         raise NotImplementedError(
             f"rotation_repr={cfg.model.rotation_repr!r} not supported here (see evaluate.py)"
@@ -102,6 +120,8 @@ def main():
     norm_stats = load_norm_stats_from_checkpoint(ckpt)
     part_to_idx = part_to_idx_from_checkpoint(ckpt)
     task_idx_value = part_to_idx[part]
+    camera_keys = list(cfg.model.camera_keys)
+    image_hw = cfg.data.image_resize_hw or (240, 320)
 
     horizon = cfg.data.horizon
     action_dim = cfg.model.action_dim
@@ -110,8 +130,9 @@ def main():
     gen = torch.Generator(device=device).manual_seed(args.seed)
 
     sys.stderr.write(
-        f"[dp_server_stateonly] loaded {args.ckpt} part={part} "
+        f"[dp_server_vision] loaded {args.ckpt} part={part} "
         f"weights={'ema' if not args.no_ema else 'raw'} horizon={horizon} "
+        f"cameras={camera_keys} image_hw={image_hw} "
         f"num_inference_steps={num_inference_steps} device={device}\n"
     )
     sys.stderr.flush()
@@ -141,6 +162,12 @@ def main():
         state_t = torch.from_numpy(state_n).to(device)
         task_idx = torch.full((1,), task_idx_value, dtype=torch.long, device=device)
 
+        raw_images = msg["images"]
+        images = {
+            cam: _prep_image(np.asarray(raw_images[cam], dtype=np.uint8), image_hw, device)
+            for cam in camera_keys
+        }
+
         action_n = ddim_sample(
             model, state_t, task_idx, horizon, action_dim,
             num_train_timesteps=cfg.diffusion.num_train_timesteps,
@@ -150,6 +177,7 @@ def main():
             num_inference_steps=num_inference_steps,
             device=device,
             generator=gen,
+            images=images,
         )
         action = unnormalize_action(action_n.cpu().numpy(), norm_stats, part)[0]  # (horizon, 7)
         _write(_out, {"action_horizon": action.astype(np.float32).tolist()})
