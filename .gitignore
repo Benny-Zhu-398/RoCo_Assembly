@@ -15,6 +15,7 @@ __pycache__/
 logs/
 outputs/
 outputs_vision/
+outputs_grouped/
 artifacts/
 task/*_server.log
 

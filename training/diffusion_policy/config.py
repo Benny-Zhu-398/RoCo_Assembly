@@ -132,7 +132,7 @@ class DiffusionConfig:
 @dataclass
 class TrainConfig:
     batch_size: int = 64
-    num_epochs: int = 200
+    num_epochs: int = 100
     lr: float = 1.0e-4
     weight_decay: float = 1.0e-6
     grad_clip_norm: float = 1.0
