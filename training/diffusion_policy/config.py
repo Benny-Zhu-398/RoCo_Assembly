@@ -11,7 +11,10 @@ from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Optional, Tuple
 
-from constants import ACTION_DIM, CAMERA_KEYS, DATASET_DEFAULT_ROOT, NUM_PARTS, PART_ORDER, STATE_DIM
+from constants import (
+    ACTION_DIM, CAMERA_KEYS, DATASET_DEFAULT_ROOT, GROUP_ORDER, NUM_PARTS,
+    PART_ORDER, PART_TO_GROUP, STATE_DIM,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -19,10 +22,18 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 @dataclass
 class DataConfig:
     dataset_root: str = DATASET_DEFAULT_ROOT
-    # Stage-1: a single part. Stage-2/3 curriculum reuses the exact same
-    # dataset/model code with `parts` set to a group instead of one name —
-    # nothing here is part-count-specific.
+    # Stage-1: a single part (used when group is None, the default).
     part: str = "gear_20teeth"
+    # Stage-2/3: set to one of constants.GROUP_ORDER (train only that
+    # group's parts -- e.g. for isolated debugging of one skill head) or the
+    # literal string "all" (every part across every group, the real joint
+    # run grouped_model.GroupedDiffusionPolicyNet is meant for -- one shared
+    # trunk amortized over all 4 groups, each sample routed to its own
+    # skill head). None (default) = ignore this field, use `part` alone via
+    # the original single-part model.py::DiffusionPolicyNet path; train.py
+    # branches its model class on group is None vs not, not on a separate
+    # flag, so there is exactly one source of truth for which path runs.
+    group: Optional[str] = None
     horizon: int = 16          # predicted action chunk length (T_pred)
     n_obs_steps: int = 1       # state-only single-timestep conditioning
     val_fraction: float = 0.1
@@ -34,13 +45,25 @@ class DataConfig:
     image_resize_hw: Optional[Tuple[int, int]] = None
 
     def __post_init__(self) -> None:
-        if self.part not in PART_ORDER:
+        if self.group is not None and self.group != "all" and self.group not in GROUP_ORDER:
+            raise ValueError(f"unknown group {self.group!r}, expected 'all' or one of {GROUP_ORDER}")
+        if self.group is None and self.part not in PART_ORDER:
             raise ValueError(f"unknown part {self.part!r}, expected one of {PART_ORDER}")
         if self.n_obs_steps != 1:
             raise NotImplementedError(
                 "StateEncoder currently consumes a single timestep; "
                 "n_obs_steps > 1 needs a history-stacking change in dataset.py/model.py first."
             )
+
+    def resolved_parts(self) -> Tuple[str, ...]:
+        """The actual list of parts to load, honoring group over part when
+        group is set. Single source of truth train.py/dataset.py should call
+        instead of branching on `group is None` themselves."""
+        if self.group is None:
+            return (self.part,)
+        if self.group == "all":
+            return PART_ORDER
+        return tuple(p for p in PART_ORDER if PART_TO_GROUP[p] == self.group)
 
 
 @dataclass

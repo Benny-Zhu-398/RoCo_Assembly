@@ -42,6 +42,44 @@ RELEASE_MODE = {
     "battery_size5": "open",
 }
 
+# --- skill-head grouping (grouped_model.py) ---
+# Deterministic part -> group routing for the multi-head FiLM architecture
+# (2026-08-18 design discussion). Groups are NOT the same partition as
+# RELEASE_MODE above -- "connectors" and "fasteners" are both RELEASE_MODE
+# "snap" but get separate skill heads because hdmi/usb_a (electrical
+# connector insertion) and rod_16mm/bolt_8mm/pin (mechanical fastener
+# insertion) need different geometry/tolerance behavior, not because their
+# release logic differs.
+GROUP_ORDER = ("gears", "batteries", "connectors", "fasteners")
+PART_TO_GROUP = {
+    "gear_20teeth": "gears",
+    "gear_60teeth": "gears",
+    "battery_size1": "batteries",
+    "battery_size5": "batteries",
+    "hdmi": "connectors",
+    "usb_a": "connectors",
+    "rod_16mm": "fasteners",
+    "bolt_8mm": "fasteners",
+    "pin": "fasteners",
+}
+assert set(PART_TO_GROUP) == set(PART_ORDER), "PART_TO_GROUP must cover exactly PART_ORDER"
+assert set(PART_TO_GROUP.values()) == set(GROUP_ORDER), "PART_TO_GROUP must only use GROUP_ORDER names"
+GROUP_TO_IDX = {g: i for i, g in enumerate(GROUP_ORDER)}
+NUM_GROUPS = len(GROUP_ORDER)
+
+# open-type groups feed a_t^BC straight to the final action; snap-type groups
+# additionally route through the residual policy (see grouped_model.py's
+# ResidualPolicyStub). Derived from RELEASE_MODE, not hand-duplicated, so the
+# two can never silently disagree about a part that's in both.
+GROUP_RELEASE_MODE = {g: {RELEASE_MODE[p] for p, gr in PART_TO_GROUP.items() if gr == g}.pop() for g in GROUP_ORDER}
+for _g, _members in {g: [p for p, gr in PART_TO_GROUP.items() if gr == g] for g in GROUP_ORDER}.items():
+    assert len({RELEASE_MODE[p] for p in _members}) == 1, (
+        f"group {_g!r} mixes RELEASE_MODE across its parts {_members} -- "
+        "GROUP_RELEASE_MODE assumes one release behavior per group"
+    )
+SNAP_GROUPS = tuple(g for g in GROUP_ORDER if GROUP_RELEASE_MODE[g] == "snap")
+OPEN_GROUPS = tuple(g for g in GROUP_ORDER if GROUP_RELEASE_MODE[g] == "open")
+
 # --- observation.state, 44-D (tools/roco2026_by_part/meta/info.json) ---
 STATE_DIM_FULL = 44
 STATE_NAMES_FULL = (

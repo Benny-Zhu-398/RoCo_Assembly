@@ -14,7 +14,10 @@ Message in : {"cmd": "reset"} OR
                                         norm_stats, never recomputed)
 Message out: {"ok": True} OR
               {"action_horizon": (horizon, 7) f32 list-of-lists}  -- RAW
-              (unnormalized) units: xyz(3) + rotvec(3) + gripper(1).
+              (unnormalized) units: xyz(3) + euler-xyz(3) + gripper(1) --
+              see task/policies/diffusion_stateonly.py's ACTION ROTATION
+              CONVENTION note for why this is Euler XYZ, not rotvec, despite
+              the column names.
               Caller (diffusion_stateonly.py) picks how many of the horizon
               steps to actually execute (n_action_steps) before re-querying;
               this server always returns the *full* predicted horizon so
