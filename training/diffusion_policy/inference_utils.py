@@ -20,6 +20,7 @@ if str(_THIS_DIR) not in sys.path:
     sys.path.insert(0, str(_THIS_DIR))
 
 from config import ExperimentConfig  # noqa: E402
+from grouped_model import GroupedDiffusionPolicyNet  # noqa: E402
 from model import DiffusionPolicyNet  # noqa: E402
 from normalization import NormStats  # noqa: E402
 
@@ -40,6 +41,40 @@ def build_model_from_checkpoint(
     cfg = ExperimentConfig.from_dict(ckpt["config"])
     vision_image_hw = cfg.data.image_resize_hw or (240, 320)
     model = DiffusionPolicyNet(cfg.model, vision_image_hw=vision_image_hw).to(device)
+
+    state_dict = None
+    if use_ema:
+        state_dict = ckpt.get("ema_state_dict")
+        if state_dict is None:
+            print("[inference_utils] WARNING: checkpoint has no EMA weights "
+                  "(use_ema was False at train time); falling back to raw weights.")
+    if state_dict is None:
+        state_dict = ckpt["model_state_dict"]
+
+    model.load_state_dict(state_dict)
+    model.eval()
+    for p in model.parameters():
+        p.requires_grad_(False)
+    return model, cfg
+
+
+def build_grouped_model_from_checkpoint(
+    ckpt: dict, device: torch.device, use_ema: bool = True
+) -> Tuple[GroupedDiffusionPolicyNet, ExperimentConfig]:
+    """Sibling of build_model_from_checkpoint for a checkpoint saved by
+    train.py's --group path (ckpt["group"] is not None, ckpt["part"] is
+    None -- see grouped_model.py's module docstring, "SCOPE OF THIS PASS":
+    this adapter work was explicitly deferred when GroupedDiffusionPolicyNet
+    was added, so a grouped checkpoint could not be loaded for inference at
+    all before this function existed."""
+    if ckpt.get("group") is None:
+        raise ValueError(
+            "checkpoint has no group (ckpt['group'] is None) -- this is a single-part "
+            "checkpoint, use build_model_from_checkpoint instead."
+        )
+    cfg = ExperimentConfig.from_dict(ckpt["config"])
+    vision_image_hw = cfg.data.image_resize_hw or (240, 320)
+    model = GroupedDiffusionPolicyNet(cfg.model, vision_image_hw=vision_image_hw).to(device)
 
     state_dict = None
     if use_ema:
@@ -132,6 +167,61 @@ def ddim_sample(
         trajectory = scheduler.step(model_output, t, trajectory, eta=0.0, generator=generator).prev_sample
 
     return trajectory
+
+
+@torch.no_grad()
+def ddim_sample_grouped(
+    model: GroupedDiffusionPolicyNet,
+    state: torch.Tensor,
+    task_idx: torch.Tensor,
+    horizon: int,
+    action_dim: int,
+    num_train_timesteps: int,
+    beta_schedule: str,
+    prediction_type: str,
+    clip_sample: bool,
+    num_inference_steps: int,
+    device: torch.device,
+    generator: Optional[torch.Generator] = None,
+    images: Optional[Dict[str, torch.Tensor]] = None,
+    residual_context: Optional[dict] = None,
+) -> torch.Tensor:
+    """Sibling of ddim_sample for GroupedDiffusionPolicyNet: same DDIM loop
+    (identical scheduler config/timestep-spacing rationale, see ddim_sample's
+    docstring), but conditioning is computed once via
+    model.shared_condition() (-> global_cond, group_idx) instead of
+    model.global_cond(), and each step calls model.predict_noise(...,
+    global_cond, group_idx) instead of model.unet(..., global_cond=...) --
+    routing to the right group's skill head happens inside predict_noise.
+
+    Unlike ddim_sample, the returned tensor is ALREADY a_t^final (residual
+    correction applied via model.predict_action), not the raw denoised
+    a_t^BC -- callers should NOT unnormalize-and-use ddim_sample's output
+    convention of "still needs residual applied" because there is no
+    separate residual step for the single-part model this mirrors.
+    residual_context is forwarded to model.predict_action's `context` arg
+    (currently unused -- ResidualPolicyStub ignores it, see grouped_model.py).
+    """
+    from diffusers.schedulers.scheduling_ddim import DDIMScheduler
+
+    scheduler = DDIMScheduler(
+        num_train_timesteps=num_train_timesteps,
+        beta_schedule=beta_schedule,
+        prediction_type=prediction_type,
+        clip_sample=clip_sample,
+        timestep_spacing="trailing",
+    )
+    scheduler.set_timesteps(num_inference_steps, device=device)
+
+    B = state.shape[0]
+    global_cond, group_idx = model.shared_condition(state, task_idx, images)
+    trajectory = torch.randn((B, horizon, action_dim), generator=generator, device=device)
+
+    for t in scheduler.timesteps:
+        model_output = model.predict_noise(trajectory, t, global_cond, group_idx)
+        trajectory = scheduler.step(model_output, t, trajectory, eta=0.0, generator=generator).prev_sample
+
+    return model.predict_action(trajectory, task_idx, residual_context)
 
 
 def _rotvec_to_matrix(rotvec: np.ndarray) -> np.ndarray:
