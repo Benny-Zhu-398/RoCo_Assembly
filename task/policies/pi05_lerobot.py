@@ -1,4 +1,30 @@
-"""Deploy a LeRobot Pi0.5 policy in the Isaac Sim harness."""
+"""Deploy a LeRobot Pi0.5 policy in the Isaac Sim harness.
+
+=== GRIPPER UNITS -- raw joint radians, NOT a [0,1] open-ratio ===
+
+Both the STATE and the ACTION gripper dims of the dataset these checkpoints are
+fine-tuned on are raw joint radians. Measured over all 121454 frames of
+tools/roco2026_by_part, `observation.state[42]` and `action[6]` (both
+left_gripper) have the same distribution:
+
+    p1 0.060   p50 0.1053   p99 0.3008   mean 0.146   (both columns)
+
+Identical means settle it: if the state were a ratio of the action's raw value
+over the 0.665 rad fully-open joint value, its mean would be ~0.22, not 0.146.
+(The state column's exact 0.0/1.0 min/max come from 24 outlier frames of
+121454, not from a [0,1] encoding.)
+
+An earlier version of this file divided the state gripper by a
+`GRIPPER_OPEN_LIMIT = 0.6649704` to send a ratio, and multiplied the predicted
+gripper back by the same constant -- so the state went in ~1.5x too large and
+the commanded opening came out 0.665x too small. That is the same bug
+policies/diffusion_stateonly.py already found and fixed for the DP checkpoint;
+see its "GRIPPER UNITS" docstring section. No rescale belongs anywhere in this
+file, in either direction.
+
+policies/diffusion_lerobot.py keeps the ratio convention on purpose -- it
+serves a checkpoint trained on a different export. Do not "fix" it to match.
+"""
 from __future__ import annotations
 
 from collections import deque
@@ -194,6 +220,32 @@ def _resize_rgb(img):
 
 
 def _euler_xyz_to_quat_wxyz(rx, ry, rz):
+    """Euler XYZ EXTRINSIC angles -> wxyz quat -- NOT axis-angle/rotvec.
+
+    The pi0.5 checkpoints are fine-tuned on tools/roco2026_by_part, sliced
+    from rocochallenge2025/rocochallenge2026_Industrial_Assembly, whose
+    action rotation dims are Euler XYZ extrinsic despite the
+    "left_ee_rx/ry/rz" column names. Measured over that dataset's 121454
+    frames, as geodesic distance from each decode to the same frame's state
+    quaternion:
+
+        Euler XYZ decode:  p50=0.605 deg  p90= 3.40 deg  mean= 3.98 deg
+        rotvec   decode:   p50=1.038 deg  p90=60.93 deg  mean=16.12 deg
+
+    Independently: the raw rotation triple's norm has median exactly pi with
+    83% of frames above pi (max 7.98). A rotation vector's norm is its
+    rotation angle and cannot exceed pi, so the triple is not axis-angle.
+
+    Small per-step rotations look alike under either convention -- hence the
+    deceptively small median for the wrong decode -- but large reorientations
+    diverge by tens of degrees, enough for Lula IK to reject the target pose
+    and freeze the arm until the per-part timeout.
+
+    Do NOT reuse this for the self-collected collect_lerobot_v3.py/v4.py
+    datasets ("absolute_cartesian_target_xyz_rotvec_gripper"), which really
+    are rotvec -- policies/act_eval_usb.py and act_eval_gear.py decode those
+    correctly and must stay as they are.
+    """
     from scipy.spatial.transform import Rotation
 
     x, y, z, w = Rotation.from_euler("xyz", [rx, ry, rz]).as_quat()
@@ -453,7 +505,10 @@ class Pi05LeRobotPolicy(Policy):
         else:
             Rp, Rq = np.zeros(3), np.array([1.0, 0.0, 0.0, 0.0])
 
-        return np.concatenate(
+        # Raw joint radians, not a ratio -- see the module docstring's GRIPPER
+        # UNITS note. Always sends all 44 dims: pi05_server.py slices this down
+        # to the 22-D left-arm layout itself when the checkpoint wants that.
+        full = np.concatenate(
             [
                 np.asarray(Lp).reshape(-1)[:3],
                 np.asarray(Lq).reshape(-1)[:4],
@@ -467,7 +522,9 @@ class Pi05LeRobotPolicy(Policy):
                 [float(q[self._Lg])],
                 [float(q[self._Rg]) if self._Rg is not None else 0.0],
             ]
-        ).astype(np.float32)
+        )
+        assert full.shape == (44,), f"expected 44-D full state, got {full.shape}"
+        return full.astype(np.float32)
 
     def predict_raw(self, obs: Observation, exec_horizon=1):
         if exec_horizon <= 0:

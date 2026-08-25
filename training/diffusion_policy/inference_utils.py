@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import torch
@@ -20,6 +20,7 @@ if str(_THIS_DIR) not in sys.path:
     sys.path.insert(0, str(_THIS_DIR))
 
 from config import ExperimentConfig  # noqa: E402
+from grouped_model import GroupedDiffusionPolicyNet  # noqa: E402
 from model import DiffusionPolicyNet  # noqa: E402
 from normalization import NormStats  # noqa: E402
 
@@ -38,7 +39,42 @@ def build_model_from_checkpoint(
     and load either the EMA shadow weights (default, standard DP inference
     recipe) or the raw optimizer-iterate weights."""
     cfg = ExperimentConfig.from_dict(ckpt["config"])
-    model = DiffusionPolicyNet(cfg.model).to(device)
+    vision_image_hw = cfg.data.image_resize_hw or (240, 320)
+    model = DiffusionPolicyNet(cfg.model, vision_image_hw=vision_image_hw).to(device)
+
+    state_dict = None
+    if use_ema:
+        state_dict = ckpt.get("ema_state_dict")
+        if state_dict is None:
+            print("[inference_utils] WARNING: checkpoint has no EMA weights "
+                  "(use_ema was False at train time); falling back to raw weights.")
+    if state_dict is None:
+        state_dict = ckpt["model_state_dict"]
+
+    model.load_state_dict(state_dict)
+    model.eval()
+    for p in model.parameters():
+        p.requires_grad_(False)
+    return model, cfg
+
+
+def build_grouped_model_from_checkpoint(
+    ckpt: dict, device: torch.device, use_ema: bool = True
+) -> Tuple[GroupedDiffusionPolicyNet, ExperimentConfig]:
+    """Sibling of build_model_from_checkpoint for a checkpoint saved by
+    train.py's --group path (ckpt["group"] is not None, ckpt["part"] is
+    None -- see grouped_model.py's module docstring, "SCOPE OF THIS PASS":
+    this adapter work was explicitly deferred when GroupedDiffusionPolicyNet
+    was added, so a grouped checkpoint could not be loaded for inference at
+    all before this function existed."""
+    if ckpt.get("group") is None:
+        raise ValueError(
+            "checkpoint has no group (ckpt['group'] is None) -- this is a single-part "
+            "checkpoint, use build_model_from_checkpoint instead."
+        )
+    cfg = ExperimentConfig.from_dict(ckpt["config"])
+    vision_image_hw = cfg.data.image_resize_hw or (240, 320)
+    model = GroupedDiffusionPolicyNet(cfg.model, vision_image_hw=vision_image_hw).to(device)
 
     state_dict = None
     if use_ema:
@@ -81,6 +117,7 @@ def ddim_sample(
     num_inference_steps: int,
     device: torch.device,
     generator: Optional[torch.Generator] = None,
+    images: Optional[Dict[str, torch.Tensor]] = None,
 ) -> torch.Tensor:
     """Deterministic (eta=0) DDIM sampling. Returns normalized actions,
     shape (B, horizon, action_dim) -- caller unnormalizes.
@@ -122,7 +159,7 @@ def ddim_sample(
     scheduler.set_timesteps(num_inference_steps, device=device)
 
     B = state.shape[0]
-    global_cond = model.global_cond(state, task_idx)
+    global_cond = model.global_cond(state, task_idx, images)
     trajectory = torch.randn((B, horizon, action_dim), generator=generator, device=device)
 
     for t in scheduler.timesteps:
@@ -130,6 +167,61 @@ def ddim_sample(
         trajectory = scheduler.step(model_output, t, trajectory, eta=0.0, generator=generator).prev_sample
 
     return trajectory
+
+
+@torch.no_grad()
+def ddim_sample_grouped(
+    model: GroupedDiffusionPolicyNet,
+    state: torch.Tensor,
+    task_idx: torch.Tensor,
+    horizon: int,
+    action_dim: int,
+    num_train_timesteps: int,
+    beta_schedule: str,
+    prediction_type: str,
+    clip_sample: bool,
+    num_inference_steps: int,
+    device: torch.device,
+    generator: Optional[torch.Generator] = None,
+    images: Optional[Dict[str, torch.Tensor]] = None,
+    residual_context: Optional[dict] = None,
+) -> torch.Tensor:
+    """Sibling of ddim_sample for GroupedDiffusionPolicyNet: same DDIM loop
+    (identical scheduler config/timestep-spacing rationale, see ddim_sample's
+    docstring), but conditioning is computed once via
+    model.shared_condition() (-> global_cond, group_idx) instead of
+    model.global_cond(), and each step calls model.predict_noise(...,
+    global_cond, group_idx) instead of model.unet(..., global_cond=...) --
+    routing to the right group's skill head happens inside predict_noise.
+
+    Unlike ddim_sample, the returned tensor is ALREADY a_t^final (residual
+    correction applied via model.predict_action), not the raw denoised
+    a_t^BC -- callers should NOT unnormalize-and-use ddim_sample's output
+    convention of "still needs residual applied" because there is no
+    separate residual step for the single-part model this mirrors.
+    residual_context is forwarded to model.predict_action's `context` arg
+    (currently unused -- ResidualPolicyStub ignores it, see grouped_model.py).
+    """
+    from diffusers.schedulers.scheduling_ddim import DDIMScheduler
+
+    scheduler = DDIMScheduler(
+        num_train_timesteps=num_train_timesteps,
+        beta_schedule=beta_schedule,
+        prediction_type=prediction_type,
+        clip_sample=clip_sample,
+        timestep_spacing="trailing",
+    )
+    scheduler.set_timesteps(num_inference_steps, device=device)
+
+    B = state.shape[0]
+    global_cond, group_idx = model.shared_condition(state, task_idx, images)
+    trajectory = torch.randn((B, horizon, action_dim), generator=generator, device=device)
+
+    for t in scheduler.timesteps:
+        model_output = model.predict_noise(trajectory, t, global_cond, group_idx)
+        trajectory = scheduler.step(model_output, t, trajectory, eta=0.0, generator=generator).prev_sample
+
+    return model.predict_action(trajectory, task_idx, residual_context)
 
 
 def _rotvec_to_matrix(rotvec: np.ndarray) -> np.ndarray:
@@ -167,11 +259,73 @@ def geodesic_angle_deg(rotvec_pred: np.ndarray, rotvec_gt: np.ndarray) -> np.nda
     known to occur in this dataset's action encoding (see
     rotation_utils.find_rotvec_jumps).
 
+    Inputs are interpreted as ROTATION VECTORS (axis-angle). Only valid for
+    action data actually encoded that way -- confirmed true for the
+    self-collected collect_lerobot_v3.py/v4.py datasets (metadata:
+    "absolute_cartesian_target_xyz_rotvec_gripper"), confirmed FALSE for
+    tools/roco2026_by_part (see rotation_convention_audit.py: its action
+    rotation dims are Euler XYZ extrinsic, not rotvec). Use
+    `geodesic_angle_deg_euler_xyz` below for anything derived from
+    PartSequenceDataset (evaluate.py, sanity_check.py) -- this function is
+    for the true-rotvec datasets only.
+
     rotvec_pred / rotvec_gt: (..., 3). Returns (...,) in degrees.
     """
     shape = rotvec_pred.shape[:-1]
     Rp = _rotvec_to_matrix(rotvec_pred).reshape(-1, 3, 3)
     Rg = _rotvec_to_matrix(rotvec_gt).reshape(-1, 3, 3)
+    R_rel = np.einsum("nij,njk->nik", Rp.transpose(0, 2, 1), Rg)
+    trace = np.einsum("nii->n", R_rel)
+    cos_angle = np.clip((trace - 1.0) / 2.0, -1.0, 1.0)
+    angle_rad = np.arccos(cos_angle)
+    return np.degrees(angle_rad).reshape(shape)
+
+
+def _euler_xyz_extrinsic_to_matrix(euler: np.ndarray) -> np.ndarray:
+    """(..., 3) [rx, ry, rz] Euler-XYZ EXTRINSIC angles -> (..., 3, 3),
+    i.e. R = Rz(rz) @ Ry(ry) @ Rx(rx) (scipy's lowercase 'xyz' convention).
+
+    This is the convention tools/roco2026_by_part's action rotation dims
+    actually use -- empirically confirmed in rotation_convention_audit.py
+    by comparing against same-frame state quaternions: pooled across all 9
+    parts, decoding this way gives median/mean/p90 geodesic error of
+    ~0.6/4.0/3.4 deg vs. ~1.0/16.1/60.9 deg for the axis-angle (rotvec)
+    decode this metric used before, and ~1.0/22.3/103.5 deg for the
+    intrinsic 'XYZ' variant. Do not decode roco2026_by_part's action
+    rotation dims any other way.
+    """
+    e = np.asarray(euler, dtype=np.float64).reshape(-1, 3)
+    zeros, ones = np.zeros(e.shape[0]), np.ones(e.shape[0])
+
+    def axis_mat(axis: str, a: np.ndarray) -> np.ndarray:
+        c, s = np.cos(a), np.sin(a)
+        if axis == "x":
+            m = np.stack([ones, zeros, zeros, zeros, c, -s, zeros, s, c], axis=-1)
+        elif axis == "y":
+            m = np.stack([c, zeros, s, zeros, ones, zeros, -s, zeros, c], axis=-1)
+        else:
+            m = np.stack([c, -s, zeros, s, c, zeros, zeros, zeros, ones], axis=-1)
+        return m.reshape(-1, 3, 3)
+
+    Rx, Ry, Rz = axis_mat("x", e[:, 0]), axis_mat("y", e[:, 1]), axis_mat("z", e[:, 2])
+    R = np.einsum("nij,njk->nik", Rz, Ry)
+    R = np.einsum("nij,njk->nik", R, Rx)
+    return R.reshape(euler.shape[:-1] + (3, 3))
+
+
+def geodesic_angle_deg_euler_xyz(euler_pred: np.ndarray, euler_gt: np.ndarray) -> np.ndarray:
+    """Same geodesic-distance metric as `geodesic_angle_deg`, but interprets
+    its inputs as Euler-XYZ EXTRINSIC angles instead of rotvec -- the
+    correct convention for tools/roco2026_by_part's action rotation dims
+    (see `_euler_xyz_extrinsic_to_matrix` and rotation_convention_audit.py).
+    Use this, not `geodesic_angle_deg`, for any action-rotation error metric
+    computed from a PartSequenceDataset-derived action.
+
+    euler_pred / euler_gt: (..., 3). Returns (...,) in degrees.
+    """
+    shape = euler_pred.shape[:-1]
+    Rp = _euler_xyz_extrinsic_to_matrix(euler_pred).reshape(-1, 3, 3)
+    Rg = _euler_xyz_extrinsic_to_matrix(euler_gt).reshape(-1, 3, 3)
     R_rel = np.einsum("nij,njk->nik", Rp.transpose(0, 2, 1), Rg)
     trace = np.einsum("nii->n", R_rel)
     cos_angle = np.clip((trace - 1.0) / 2.0, -1.0, 1.0)

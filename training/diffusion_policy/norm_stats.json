@@ -98,6 +98,28 @@
     "left_ee_rz",
     "left_gripper"
   ],
+  "gripper_action_min": {
+    "gear_20teeth": 0.09774871170520782,
+    "gear_60teeth": 0.1804591566324234,
+    "rod_16mm": 0.0601530522108078,
+    "bolt_8mm": 0.0601530522108078,
+    "usb_a": 0.0601530522108078,
+    "hdmi": 0.0601530522108078,
+    "pin": 0.08271044492721558,
+    "battery_size1": 0.10526784509420395,
+    "battery_size5": 0.07519131898880005
+  },
+  "gripper_action_max": {
+    "gear_20teeth": 0.1804591566324234,
+    "gear_60teeth": 0.3007652759552002,
+    "rod_16mm": 0.3007652759552002,
+    "bolt_8mm": 0.22557395696640015,
+    "usb_a": 0.22557395696640015,
+    "hdmi": 0.22557395696640015,
+    "pin": 0.3007652759552002,
+    "battery_size1": 0.3007652759552002,
+    "battery_size5": 0.3007652759552002
+  },
   "meta": {
     "dataset_root": "C:\\Users\\haozh\\repos\\RoCo_Assembly\\tools\\roco2026_by_part",
     "parts": [

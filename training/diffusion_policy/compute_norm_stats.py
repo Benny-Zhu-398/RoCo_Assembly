@@ -47,6 +47,7 @@ def main() -> None:
     data["task"] = data["episode_index"].map(ep2task)
 
     train_states, train_actions = [], []
+    train_actions_per_part = {}
     per_part_n_train_frames = {}
     for part in PART_ORDER:
         ep_ids = episode_ids_for_part(episodes, part)
@@ -58,15 +59,17 @@ def main() -> None:
 
         state_full = np.stack(data.loc[mask, "observation.state"].to_numpy())
         action_full = np.stack(data.loc[mask, "action"].to_numpy())
+        part_action = action_full[:, LEFT_ACTION_IDX]
         train_states.append(state_full[:, LEFT_STATE_IDX])
-        train_actions.append(action_full[:, LEFT_ACTION_IDX])
+        train_actions.append(part_action)
+        train_actions_per_part[part] = part_action
 
     all_states = np.concatenate(train_states, axis=0)
     all_actions = np.concatenate(train_actions, axis=0)
     print(f"\npooled across all {len(PART_ORDER)} parts: {all_states.shape[0]} train frames")
 
     stats = NormStats.compute(
-        all_states, all_actions,
+        all_states, all_actions, train_actions_per_part,
         quantile_lo=args.quantile_lo, quantile_hi=args.quantile_hi,
         meta={
             "dataset_root": str(dataset_root),
@@ -84,6 +87,9 @@ def main() -> None:
     print(f"state_std:  {stats.state_std}")
     print(f"action_min: {stats.action_min}")
     print(f"action_max: {stats.action_max}")
+    print("\nper-part gripper action range (rad) -- NOT pooled:")
+    for part in PART_ORDER:
+        print(f"  {part:<16} min={stats.gripper_action_min[part]:.4f}  max={stats.gripper_action_max[part]:.4f}")
     print(f"\nWrote {args.out}")
 
 

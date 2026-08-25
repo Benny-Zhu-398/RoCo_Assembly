@@ -56,6 +56,36 @@ the ratio convention by analogy with diffusion_lerobot.py; that analogy
 was wrong for this dataset -- re-check norm_stats.json yourself if this
 checkpoint is ever retrained against a different data export.)
 
+=== ACTION ROTATION CONVENTION -- Euler XYZ extrinsic, NOT rotvec ===
+
+The action's 3 rotation dims (a[3:6]) are Euler XYZ EXTRINSIC angles
+(R = Rz(rz) @ Ry(ry) @ Rx(rx), scipy's lowercase 'xyz'), not a rotation
+vector, despite the column names ("left_ee_rx/ry/rz") and this repo's
+earlier assumption being convention-agnostic-looking. tools/roco2026_by_part
+is sliced from the public HF dataset
+rocochallenge2025/rocochallenge2026_Industrial_Assembly by
+tools/segment_by_part.py; that source dataset encodes action orientation as
+Euler XYZ, unlike this repo's own self-collected collect_lerobot_v3.py/
+v4.py datasets, whose metadata literally says
+"absolute_cartesian_target_xyz_rotvec_gripper" (true rotvec -- see
+policies/act_eval_usb.py / act_eval_gear.py, which decode those correctly
+and must NOT be changed).
+
+This was previously decoded here as axis-angle (rotvec), which is why:
+  training/diffusion_policy/rotation_convention_audit.py empirically
+  confirmed the mixup by comparing both decodes' geodesic distance to the
+  SAME FRAME's state quaternion, pooled across all 9 parts:
+    rotvec (axis-angle) decode:   median=1.04 deg  mean=16.1 deg  p90=60.9 deg
+    Euler XYZ extrinsic decode:   median=0.61 deg  mean= 4.0 deg  p90= 3.4 deg
+  Small per-step rotations look similar under either convention (hence a
+  deceptively small median with the old, wrong decode) but larger
+  reorientations diverge by tens of degrees -- enough to make Lula IK
+  reject the target pose, freeze the arm on its last good command, and run
+  out the per-part timeout. This is very likely the root cause behind at
+  least some of the battery_size1 rollout-freeze failures gt_replay.py was
+  built to triage (see that file -- it had the identical bug and is fixed
+  alongside this one).
+
 Env vars:
   DP_CKPT_STATEONLY   path to the checkpoint .pt (required, e.g.
                        training/diffusion_policy/outputs/battery_size1/final.pt)
@@ -98,9 +128,12 @@ from policy_api import EnvInfo, Observation, PartTarget, Policy  # noqa: E402
 from constants import LEFT_STATE_IDX  # noqa: E402
 
 
-def _rotvec_to_quat_wxyz(rx, ry, rz):
+def _euler_xyz_to_quat_wxyz(rx, ry, rz):
+    """Euler XYZ EXTRINSIC angles -> wxyz quat -- see module docstring's
+    ACTION ROTATION CONVENTION note. NOT axis-angle/rotvec (that was the
+    bug); scipy's lowercase 'xyz' is the extrinsic convention."""
     from scipy.spatial.transform import Rotation
-    x, y, z, w = Rotation.from_rotvec([rx, ry, rz]).as_quat()
+    x, y, z, w = Rotation.from_euler("xyz", [rx, ry, rz]).as_quat()
     return np.array([w, x, y, z], dtype=np.float64)
 
 
@@ -223,7 +256,7 @@ class DiffusionStateOnlyPolicy(Policy):
 
         a = self._queue.pop(0)
         pos = a[:3]
-        quat = _rotvec_to_quat_wxyz(a[3], a[4], a[5])
+        quat = _euler_xyz_to_quat_wxyz(a[3], a[4], a[5])
         grip = float(a[6])  # raw joint radians -- see module docstring's GRIPPER UNITS note
         return self.L.forward(pos, quat, grip)
 

@@ -75,7 +75,24 @@ def _resize_rgb(img):
 
 
 def _rotvec_to_quat_wxyz(rx, ry, rz):
-    """Decode the dataset-style rotation-vector orientation output."""
+    """Decode the dataset-style rotation-vector orientation output.
+
+    UNVERIFIED for whatever checkpoint you point DP_CKPT at: this file is a
+    worked EXAMPLE ("not a plug-and-play checkpoint" per the module
+    docstring), and this repo has two datasets with DIFFERENT action
+    rotation conventions -- the self-collected collect_lerobot_v3.py/v4.py
+    (true rotvec, metadata "absolute_cartesian_target_xyz_rotvec_gripper")
+    vs. tools/roco2026_by_part (Euler XYZ EXTRINSIC, NOT rotvec --
+    empirically confirmed in training/diffusion_policy/
+    rotation_convention_audit.py after task/policies/diffusion_stateonly.py
+    was found decoding roco2026_by_part-trained actions as rotvec and
+    causing large orientation errors / IK failures / arm freezes). Before
+    trusting this function for a real checkpoint, confirm which dataset it
+    was actually trained on and, if it's roco2026_by_part, decode with
+    Rotation.from_euler("xyz", [rx, ry, rz]) instead -- see
+    diffusion_stateonly.py's ACTION ROTATION CONVENTION docstring section
+    for the reference fix.
+    """
     from scipy.spatial.transform import Rotation
     x, y, z, w = Rotation.from_rotvec([rx, ry, rz]).as_quat()
     return np.array([w, x, y, z], dtype=np.float64)

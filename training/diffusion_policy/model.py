@@ -37,7 +37,7 @@ from __future__ import annotations
 import math
 import sys
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -47,6 +47,7 @@ if str(_THIS_DIR) not in sys.path:
     sys.path.insert(0, str(_THIS_DIR))
 
 from config import ModelConfig  # noqa: E402
+from vision import MultiCameraEncoder  # noqa: E402
 
 
 class StateEncoder(nn.Module):
@@ -278,14 +279,34 @@ class ConditionalUnet1D(nn.Module):
 
 
 class DiffusionPolicyNet(nn.Module):
-    """StateEncoder + TaskEncoder -> global_cond -> ConditionalUnet1D."""
+    """StateEncoder + TaskEncoder (+ optional MultiCameraEncoder) -> global_cond -> ConditionalUnet1D."""
 
-    def __init__(self, cfg: ModelConfig) -> None:
+    def __init__(self, cfg: ModelConfig, vision_image_hw: Tuple[int, int] = (240, 320)) -> None:
         super().__init__()
         self.cfg = cfg
         self.state_encoder = StateEncoder(cfg.state_dim, cfg.state_hidden_dim, cfg.state_feature_dim)
         self.task_encoder = TaskEncoder(cfg.num_parts, cfg.task_emb_dim)
         global_cond_dim = cfg.state_feature_dim + cfg.task_emb_dim
+
+        self.vision_encoder: Optional[MultiCameraEncoder] = None
+        if cfg.use_vision:
+            # vision_image_hw must match the actual (possibly decode-time
+            # resized, see config.py::DataConfig.image_resize_hw) pixel
+            # shape images arrive at -- only matters when vision_crop_hw is
+            # None (see vision.py::RgbEncoder), but always passed through
+            # for the backbone's shape-probe dummy forward pass.
+            self.vision_encoder = MultiCameraEncoder(
+                camera_keys=list(cfg.camera_keys),
+                image_hw=vision_image_hw,
+                backbone_name=cfg.vision_backbone,
+                pretrained=cfg.vision_pretrained,
+                use_group_norm=cfg.vision_use_group_norm,
+                num_keypoints=cfg.vision_num_keypoints,
+                crop_hw=cfg.vision_crop_hw,
+                crop_is_random=cfg.vision_crop_is_random,
+            )
+            global_cond_dim += self.vision_encoder.feature_dim
+
         self.unet = ConditionalUnet1D(
             input_dim=cfg.action_dim,
             global_cond_dim=global_cond_dim,
@@ -295,10 +316,20 @@ class DiffusionPolicyNet(nn.Module):
             n_groups=cfg.n_groups,
         )
 
-    def global_cond(self, state: torch.Tensor, task_idx: torch.Tensor) -> torch.Tensor:
+    def global_cond(
+        self,
+        state: torch.Tensor,
+        task_idx: torch.Tensor,
+        images: Optional[Dict[str, torch.Tensor]] = None,
+    ) -> torch.Tensor:
         state_feat = self.state_encoder(state)
         task_emb = self.task_encoder(task_idx)
-        return torch.cat([state_feat, task_emb], dim=-1)
+        feats = [state_feat, task_emb]
+        if self.vision_encoder is not None:
+            if images is None:
+                raise ValueError("cfg.use_vision=True but global_cond() got images=None")
+            feats.append(self.vision_encoder(images))
+        return torch.cat(feats, dim=-1)
 
     def forward(
         self,
@@ -306,7 +337,8 @@ class DiffusionPolicyNet(nn.Module):
         timestep: torch.Tensor,
         state: torch.Tensor,
         task_idx: torch.Tensor,
+        images: Optional[Dict[str, torch.Tensor]] = None,
     ) -> torch.Tensor:
         """noisy_action: (B, horizon, action_dim). Returns predicted noise, same shape."""
-        cond = self.global_cond(state, task_idx)
+        cond = self.global_cond(state, task_idx, images)
         return self.unet(noisy_action, timestep, global_cond=cond)

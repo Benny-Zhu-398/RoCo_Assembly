@@ -1013,6 +1013,9 @@ def main():
             "DiffusionLeRobotPolicy, or DiffusionStateOnlyPolicy"
         )
     if residual_workflow and pi05_policy_enabled:
+        # Residual RL is trained and evaluated against the local frozen policy.
+        # Do not inherit a PI05_REMOTE=1 setting from older eval shells.
+        os.environ["PI05_REMOTE"] = "0"
         os.environ["PI05_EXEC_HORIZON"] = "1"
         os.environ["PI05_SAFETY_FILTER"] = "0"
         # Checkpoints were trained with the literal LeRobot part name as task

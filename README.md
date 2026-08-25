@@ -364,6 +364,8 @@ Available adapters:
 |---------|--------------------|------------------|
 | LeRobot Diffusion Policy | [`task/policies/diffusion_lerobot.py`](task/policies/diffusion_lerobot.py) | [`task/dp_server.py`](task/dp_server.py) |
 | LeRobot pi0.5 | [`task/policies/pi05_lerobot.py`](task/policies/pi05_lerobot.py) | [`task/pi05_server.py`](task/pi05_server.py) |
+| This repo's vision Diffusion Policy (single-part checkpoint) | [`task/policies/diffusion_vision.py`](task/policies/diffusion_vision.py) | [`task/dp_server_vision.py`](task/dp_server_vision.py) |
+| This repo's vision Diffusion Policy (grouped checkpoint, `train.py --group`) | [`task/policies/diffusion_vision_grouped.py`](task/policies/diffusion_vision_grouped.py) | [`task/dp_server_vision_grouped.py`](task/dp_server_vision_grouped.py) |
 
 Both examples rebuild the dataset-style 44-D `observation.state` plus
 head/L-wrist/R-wrist RGB images from the public `Observation` surface. The
@@ -389,6 +391,19 @@ DP_CKPT=/path/to/checkpoint/pretrained_model \
 DP_SERVER_PY=/path/to/model-venv/bin/python \
 uv run python task/run_pick_place.py \
     --policy policies.diffusion_lerobot.DiffusionLeRobotPolicy
+```
+
+Run a grouped checkpoint (`training/diffusion_policy/train.py --group`, e.g.
+`outputs_grouped/connectors/final.pt`) by pointing at it with `DP_CKPT_GROUPED`
+and listing which of its parts to actually drive with `DP_TARGET_PARTS`
+(no default -- see [`task/policies/diffusion_vision_grouped.py`](task/policies/diffusion_vision_grouped.py)):
+
+```bash
+DP_CKPT_GROUPED=/path/to/outputs_grouped/connectors/final.pt \
+DP_SERVER_PY=/path/to/.venv-train/Scripts/python.exe \
+DP_TARGET_PARTS=usb_a,hdmi \
+uv run python task/run_pick_place.py \
+    --policy policies.diffusion_vision_grouped.DiffusionVisionGroupedPolicy
 ```
 
 Run a pi0.5 checkpoint with the bundled launcher:

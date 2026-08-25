@@ -21,10 +21,12 @@ All error metrics are reported in unnormalized physical units:
     near the pi-magnitude rotvec jump documented in rotation_utils.py)
   - gripper: continuous error in the action's native (unnormalized) units,
     plus accuracy after snapping both prediction and GT to the nearest of
-    11 evenly-spaced levels spanning the pooled-training gripper range
-    (norm_stats action_min/max) -- there is no discrete gripper-detent
-    definition elsewhere in this repo, so this bucketing is evaluate.py's
-    own convention, not derived from hardware.
+    11 evenly-spaced levels spanning THIS PART's own gripper action range
+    (norm_stats gripper_action_min/max[part], per-part, not pooled -- see
+    normalization.py's NormStats docstring for why pooling this dim across
+    parts was a bug) -- there is no discrete gripper-detent definition
+    elsewhere in this repo, so this bucketing is evaluate.py's own
+    convention, not derived from hardware.
 Metrics (a)/(b) are also broken out per action-chunk timestep, to see how
 error grows with prediction horizon (informs n_action_steps for the
 execution-time policy).
@@ -51,7 +53,7 @@ from dataset import PartSequenceDataset  # noqa: E402
 from inference_utils import (  # noqa: E402
     build_model_from_checkpoint,
     ddim_sample,
-    geodesic_angle_deg,
+    geodesic_angle_deg_euler_xyz,
     load_checkpoint,
     load_norm_stats_from_checkpoint,
     part_to_idx_from_checkpoint,
@@ -66,6 +68,60 @@ def summarize(values: np.ndarray) -> dict:
         "mean": float(np.mean(values)),
         "median": float(np.median(values)),
         "p95": float(np.percentile(values, 95)),
+    }
+
+
+def compute_metrics(pred_n: np.ndarray, gt_n: np.ndarray, is_pad: np.ndarray,
+                     norm_stats, part: str) -> dict:
+    """Normalized (pred, gt) action arrays (N, horizon, action_dim) + pad
+    mask -> the same position/angle/gripper error dict run_eval used to
+    build inline. Pulled out so evaluate_grouped.py (grouped checkpoints,
+    see grouped_model.py) can reuse the exact same metric definitions
+    instead of re-deriving them -- only how `pred_n`/`gt_n` get sampled
+    differs between the two scripts, not how error is measured from them."""
+    valid = ~is_pad
+
+    pred = unnormalize_action(pred_n, norm_stats, part)
+    gt = unnormalize_action(gt_n, norm_stats, part)
+
+    pred_xyz, gt_xyz = pred[..., ACTION_XYZ_SLICE], gt[..., ACTION_XYZ_SLICE]
+    pred_rotvec, gt_rotvec = pred[..., ACTION_ROT_SLICE], gt[..., ACTION_ROT_SLICE]
+    pred_gripper, gt_gripper = pred[..., ACTION_GRIPPER_IDX], gt[..., ACTION_GRIPPER_IDX]
+
+    pos_err_mm = np.linalg.norm(pred_xyz - gt_xyz, axis=-1) * 1000.0
+    # pred_rotvec/gt_rotvec are misnamed (kept for variable-name continuity
+    # with ACTION_ROT_SLICE) -- tools/roco2026_by_part's action rotation
+    # dims are Euler XYZ extrinsic, not rotvec; see
+    # rotation_convention_audit.py and inference_utils.geodesic_angle_deg's
+    # docstring. Using the rotvec-based metric here silently underreported
+    # orientation error (small per-step deltas look similar under either
+    # convention; only large reorientations diverge).
+    ang_err_deg = geodesic_angle_deg_euler_xyz(pred_rotvec, gt_rotvec)
+    gripper_err = np.abs(pred_gripper - gt_gripper)
+
+    gripper_levels = np.linspace(
+        norm_stats.gripper_action_min[part], norm_stats.gripper_action_max[part], N_GRIPPER_LEVELS,
+    )
+    pred_bin = np.argmin(np.abs(pred_gripper[..., None] - gripper_levels[None, None, :]), axis=-1)
+    gt_bin = np.argmin(np.abs(gt_gripper[..., None] - gripper_levels[None, None, :]), axis=-1)
+    snap_correct = (pred_bin == gt_bin) & valid
+
+    n_valid = int(valid.sum())
+
+    return {
+        "n_valid_steps": n_valid,
+        "position_error_mm": summarize(pos_err_mm[valid]),
+        "angle_error_deg": summarize(ang_err_deg[valid]),
+        "gripper": {
+            "continuous_error": summarize(gripper_err[valid]),
+            "snap_num_levels": N_GRIPPER_LEVELS,
+            "snap_levels": gripper_levels.tolist(),
+            "snap_accuracy": float(snap_correct.sum() / max(n_valid, 1)),
+        },
+        "per_timestep": {
+            "position_error_mm": per_timestep_summary(pos_err_mm, valid),
+            "angle_error_deg": per_timestep_summary(ang_err_deg, valid),
+        },
     }
 
 
@@ -126,6 +182,9 @@ def run_eval(
         val_fraction=cfg.data.val_fraction,
         split_seed=cfg.data.split_seed,
         rotation_repr=cfg.model.rotation_repr,
+        load_images=cfg.model.use_vision,
+        camera_keys=cfg.model.camera_keys,
+        image_resize_hw=cfg.data.image_resize_hw,
     )
     if len(val_ds) == 0:
         raise RuntimeError(f"val split for part={part!r} is empty (val_fraction={cfg.data.val_fraction})")
@@ -139,16 +198,17 @@ def run_eval(
 
     gen = torch.Generator(device=device).manual_seed(seed)
 
-    pred_xyz_all, gt_xyz_all = [], []
-    pred_rotvec_all, gt_rotvec_all = [], []
-    pred_gripper_all, gt_gripper_all = [], []
-    is_pad_all = []
+    pred_n_all, gt_n_all, is_pad_all = [], [], []
 
     for batch in loader:
         state = batch["state"].to(device)
         action_n_gt = batch["action"].to(device)
         is_pad = batch["action_is_pad"].numpy()
         task_idx = torch.full((state.shape[0],), part_to_idx[part], dtype=torch.long, device=device)
+        images = (
+            {cam: batch[f"image_{cam}"].to(device) for cam in cfg.model.camera_keys}
+            if cfg.model.use_vision else None
+        )
 
         action_n_pred = ddim_sample(
             model, state, task_idx, horizon, action_dim,
@@ -159,40 +219,18 @@ def run_eval(
             num_inference_steps=num_inference_steps,
             device=device,
             generator=gen,
+            images=images,
         )
 
-        pred = unnormalize_action(action_n_pred.cpu().numpy(), norm_stats)
-        gt = unnormalize_action(action_n_gt.cpu().numpy(), norm_stats)
-
-        pred_xyz_all.append(pred[..., ACTION_XYZ_SLICE])
-        gt_xyz_all.append(gt[..., ACTION_XYZ_SLICE])
-        pred_rotvec_all.append(pred[..., ACTION_ROT_SLICE])
-        gt_rotvec_all.append(gt[..., ACTION_ROT_SLICE])
-        pred_gripper_all.append(pred[..., ACTION_GRIPPER_IDX])
-        gt_gripper_all.append(gt[..., ACTION_GRIPPER_IDX])
+        pred_n_all.append(action_n_pred.cpu().numpy())
+        gt_n_all.append(action_n_gt.cpu().numpy())
         is_pad_all.append(is_pad)
 
-    pred_xyz = np.concatenate(pred_xyz_all, axis=0)          # (N, horizon, 3)
-    gt_xyz = np.concatenate(gt_xyz_all, axis=0)
-    pred_rotvec = np.concatenate(pred_rotvec_all, axis=0)
-    gt_rotvec = np.concatenate(gt_rotvec_all, axis=0)
-    pred_gripper = np.concatenate(pred_gripper_all, axis=0)  # (N, horizon)
-    gt_gripper = np.concatenate(gt_gripper_all, axis=0)
-    is_pad = np.concatenate(is_pad_all, axis=0)              # (N, horizon) bool
-    valid = ~is_pad
+    pred_n = np.concatenate(pred_n_all, axis=0)  # (N, horizon, action_dim)
+    gt_n = np.concatenate(gt_n_all, axis=0)
+    is_pad = np.concatenate(is_pad_all, axis=0)  # (N, horizon) bool
 
-    pos_err_mm = np.linalg.norm(pred_xyz - gt_xyz, axis=-1) * 1000.0
-    ang_err_deg = geodesic_angle_deg(pred_rotvec, gt_rotvec)
-    gripper_err = np.abs(pred_gripper - gt_gripper)
-
-    gripper_levels = np.linspace(
-        norm_stats.action_min[ACTION_GRIPPER_IDX], norm_stats.action_max[ACTION_GRIPPER_IDX], N_GRIPPER_LEVELS,
-    )
-    pred_bin = np.argmin(np.abs(pred_gripper[..., None] - gripper_levels[None, None, :]), axis=-1)
-    gt_bin = np.argmin(np.abs(gt_gripper[..., None] - gripper_levels[None, None, :]), axis=-1)
-    snap_correct = (pred_bin == gt_bin) & valid
-
-    n_valid = int(valid.sum())
+    metrics = compute_metrics(pred_n, gt_n, is_pad, norm_stats, part)
 
     return {
         "part": part,
@@ -203,19 +241,7 @@ def run_eval(
         "seed": int(seed),
         "n_val_episodes": int(n_val_episodes),
         "n_val_samples": int(len(val_ds)),
-        "n_valid_steps": n_valid,
-        "position_error_mm": summarize(pos_err_mm[valid]),
-        "angle_error_deg": summarize(ang_err_deg[valid]),
-        "gripper": {
-            "continuous_error": summarize(gripper_err[valid]),
-            "snap_num_levels": N_GRIPPER_LEVELS,
-            "snap_levels": gripper_levels.tolist(),
-            "snap_accuracy": float(snap_correct.sum() / max(n_valid, 1)),
-        },
-        "per_timestep": {
-            "position_error_mm": per_timestep_summary(pos_err_mm, valid),
-            "angle_error_deg": per_timestep_summary(ang_err_deg, valid),
-        },
+        **metrics,
     }
 
 
