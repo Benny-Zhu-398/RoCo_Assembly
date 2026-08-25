@@ -12,6 +12,7 @@ import time
 import numpy as np
 
 from policy_api import EnvInfo, Observation, PartTarget, Policy
+from policies.residual_injector import ResidualInjector
 
 _TASK_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -70,6 +71,20 @@ def _positive_env_int(name, default):
     if value <= 0:
         raise ValueError(f"{name} must be a positive integer, got {raw_value!r}")
     return value
+
+
+def _residual_action_env(name="PI05_RESIDUAL_U"):
+    raw_value = os.environ.get(name, "0,0,0,0,0,0")
+    fields = raw_value.replace(",", " ").split()
+    try:
+        action = np.asarray([float(value) for value in fields], dtype=np.float64)
+    except ValueError as exc:
+        raise ValueError(f"{name} must contain six numbers, got {raw_value!r}") from exc
+    if action.shape != (6,) or not np.isfinite(action).all():
+        raise ValueError(f"{name} must contain six finite numbers, got {raw_value!r}")
+    if np.any(action < -1.0) or np.any(action > 1.0):
+        raise ValueError(f"{name} values must lie in [-1, 1], got {raw_value!r}")
+    return action
 
 
 def _required_env(name):
@@ -192,8 +207,8 @@ def _filter_left_action(action, current_position, current_quat_wxyz, current_gri
     action = np.asarray(action, dtype=np.float64).reshape(-1)
     current_position = np.asarray(current_position, dtype=np.float64).reshape(3)
     current_quat_wxyz = np.asarray(current_quat_wxyz, dtype=np.float64).reshape(4)
-    if action.shape != (14,) or not np.isfinite(action).all():
-        raise ValueError("safety filter requires one finite 14-D action")
+    if action.shape not in {(7,), (14,)} or not np.isfinite(action).all():
+        raise ValueError("safety filter requires one finite 7-D or 14-D action")
     if not np.isfinite(current_position).all() or not np.isfinite(current_quat_wxyz).all():
         raise ValueError("safety filter requires a finite current EE pose")
     quat_norm = float(np.linalg.norm(current_quat_wxyz))
@@ -312,6 +327,9 @@ class Pi05LeRobotPolicy(Policy):
         self._action_cache = deque()
         self._control_step = 0
         self._replan_index = 0
+        self._residual_injector = ResidualInjector()
+        self._residual_u = _residual_action_env()
+        self._residual_prev_executed = np.zeros(6, dtype=np.float64)
         self._client_log_path = os.path.abspath(
             os.environ.get(
                 "PI05_CLIENT_LOG",
@@ -322,6 +340,11 @@ class Pi05LeRobotPolicy(Policy):
         with open(self._client_log_path, "w", encoding="utf-8") as client_log:
             client_log.write(f"PI05_EXEC_HORIZON={self._exec_horizon}\n")
             client_log.write(f"PI05_SAFETY_FILTER={int(self._safety_filter)}\n")
+            client_log.write(
+                "PI05_RESIDUAL_U="
+                + ",".join(f"{value:.9g}" for value in self._residual_u)
+                + "\n"
+            )
         self.L = env_info.L_controller
         self.R = getattr(env_info, "R_controller", None)
         if self.L is None:
@@ -411,6 +434,7 @@ class Pi05LeRobotPolicy(Policy):
         self._action_cache.clear()
         self._control_step = 0
         self._replan_index = 0
+        self._residual_prev_executed.fill(0.0)
         self._send({"cmd": "reset", "task": os.environ.get("PI05_TASK")})
         reply = self._recv()
         if not reply.get("ok"):
@@ -482,8 +506,11 @@ class Pi05LeRobotPolicy(Policy):
             raise RuntimeError(f"pi0.5 inference failed: {reply.get('error', reply)!r}")
 
         actions = np.asarray(reply.get("actions", [reply["action"]]), np.float64)
-        if actions.ndim != 2 or actions.shape[1] != 14:
-            raise RuntimeError(f"pi0.5 action chunk has shape {actions.shape}, expected (K, 14)")
+        if actions.ndim != 2 or actions.shape[1] not in (7, 14):
+            raise RuntimeError(
+                f"pi0.5 action chunk has shape {actions.shape}, "
+                "expected (K, 7) or (K, 14)"
+            )
         if not 1 <= actions.shape[0] <= exec_horizon:
             raise RuntimeError(
                 f"pi0.5 action chunk has length {actions.shape[0]}, expected 1..{exec_horizon}"
@@ -552,8 +579,10 @@ class Pi05LeRobotPolicy(Policy):
             raise RuntimeError(f"pi0.5 next_action failed: {reply.get('error', reply)!r}")
 
         action = np.asarray(reply["action"], np.float64).reshape(-1)
-        if action.shape != (14,):
-            raise RuntimeError(f"pi0.5 action has shape {action.shape}, expected (14,)")
+        if action.shape not in {(7,), (14,)}:
+            raise RuntimeError(
+                f"pi0.5 action has shape {action.shape}, expected (7,) or (14,)"
+            )
         if not np.isfinite(action).all():
             raise RuntimeError(f"pi0.5 action contains non-finite values: {action}")
         return {
@@ -910,6 +939,8 @@ class Pi05LeRobotPolicy(Policy):
         return records
 
     def act(self, obs: Observation):
+        from scipy.spatial.transform import Rotation
+
         action = self.predict_cached_action(obs)["action"]
         if self._safety_filter:
             current_position, current_quat = self.L.end_effector.get_world_pose()
@@ -927,9 +958,37 @@ class Pi05LeRobotPolicy(Policy):
                 f"safe_translation_m={safety['safe_translation_m']:.9f} "
                 f"safe_rotation_deg={safety['safe_rotation_deg']:.6f}"
             )
-        pos = action[:3]
-        quat = _euler_xyz_to_quat_wxyz(action[3], action[4], action[5])
-        grip = float(np.clip(action[6], 0.0, GRIPPER_OPEN_LIMIT))
+        previous_residual = self._residual_prev_executed.copy()
+        pos, quat, grip, delta_executed = self._residual_injector.inject(
+            action,
+            self._residual_u,
+            previous_residual,
+        )
+        self._residual_prev_executed = delta_executed
+        previous_rotation = Rotation.from_rotvec(previous_residual[3:])
+        executed_rotation = Rotation.from_rotvec(delta_executed[3:])
+        orientation_step_rad = float(
+            np.linalg.norm(
+                (executed_rotation * previous_rotation.inv()).as_rotvec()
+            )
+        )
+        bc_quat = _euler_xyz_to_quat_wxyz(action[3], action[4], action[5])
+        bc_rotation = Rotation.from_quat(bc_quat[[1, 2, 3, 0]])
+        final_rotation = Rotation.from_quat(quat[[1, 2, 3, 0]])
+        zero_path_rotation_error = float(
+            np.linalg.norm((final_rotation * bc_rotation.inv()).as_rotvec())
+        )
+        self._log_cache(
+            f"residual control_step={self._control_step} "
+            f"delta_pos_m={np.array2string(delta_executed[:3], precision=9, separator=',')} "
+            f"delta_pos_norm_m={np.linalg.norm(delta_executed[:3]):.9f} "
+            f"delta_rotvec_rad={np.array2string(delta_executed[3:], precision=9, separator=',')} "
+            f"delta_rotvec_norm_deg={np.degrees(np.linalg.norm(delta_executed[3:])):.9f} "
+            f"orientation_slew_step_deg={np.degrees(orientation_step_rad):.9f} "
+            f"bc_position_difference_m={np.linalg.norm(pos - action[:3]):.9f} "
+            f"bc_rotation_difference_deg={np.degrees(zero_path_rotation_error):.9f}"
+        )
+        grip = float(np.clip(grip, 0.0, GRIPPER_OPEN_LIMIT))
         control_action = self.L.forward(pos, quat, grip)
         if self._safety_filter:
             guarded_positions, joint_safety = _guard_left_joint_action(

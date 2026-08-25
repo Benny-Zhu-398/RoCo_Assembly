@@ -22,6 +22,18 @@ from lerobot.policies import make_pre_post_processors
 from lerobot.policies.pi05.modeling_pi05 import PI05Policy
 from lerobot.utils.constants import ACTION
 
+# Keep the state slicing rule shared with the left-only dataset builder.
+sys.path.insert(
+    0,
+    os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "..",
+        "training",
+        "diffusion_policy",
+    ),
+)
+from constants import LEFT_STATE_IDX, STATE_DIM_FULL  # noqa: E402
+
 
 if len(sys.argv) != 2:
     raise SystemExit("usage: python pi05_server.py /path/to/checkpoint/pretrained_model")
@@ -32,6 +44,7 @@ TASK = os.environ.get("PI05_TASK", "assemble parts onto the task board")
 
 policy = PI05Policy.from_pretrained(CKPT)
 policy.eval().to(DEV)
+ACTION_DIM = int(policy.config.output_features[ACTION].shape[0])
 
 preprocessor, postprocessor = make_pre_post_processors(
     policy_cfg=policy.config,
@@ -41,7 +54,45 @@ preprocessor, postprocessor = make_pre_post_processors(
     postprocessor_overrides={"device_processor": {"device": "cpu"}},
 )
 
-sys.stderr.write(f"[pi05_server] loaded {CKPT} on {DEV}\n")
+def _expected_state_dim():
+    """Read the true training state width from the normalizer statistics."""
+    for step in preprocessor.steps:
+        stats = getattr(step, "stats", None)
+        if stats and "observation.state" in stats:
+            return int(stats["observation.state"]["mean"].shape[0])
+    raise SystemExit("no observation.state normalization stats found in preprocessor")
+
+
+STATE_DIM = _expected_state_dim()
+if STATE_DIM == len(LEFT_STATE_IDX):
+    STATE_SLICE = list(LEFT_STATE_IDX)
+elif STATE_DIM == STATE_DIM_FULL:
+    STATE_SLICE = None
+else:
+    raise SystemExit(
+        f"checkpoint expects unsupported {STATE_DIM}-D state; expected "
+        f"{len(LEFT_STATE_IDX)} or {STATE_DIM_FULL}"
+    )
+
+
+def _adapt_state(raw):
+    """Accept the client's full state and slice it for left-only checkpoints."""
+    state = np.asarray(raw, dtype=np.float32).reshape(-1)
+    if state.shape[0] == STATE_DIM:
+        return state
+    if STATE_SLICE is not None and state.shape[0] == STATE_DIM_FULL:
+        return state[STATE_SLICE]
+    raise RuntimeError(
+        f"got {state.shape[0]}-D state, expected {STATE_DIM}-D"
+        + (f" or full {STATE_DIM_FULL}-D" if STATE_SLICE is not None else "")
+    )
+
+
+sys.stderr.write(
+    f"[pi05_server] loaded {CKPT} on {DEV} "
+    f"action_dim={ACTION_DIM} state_dim={STATE_DIM} "
+    f"right_arm={'excluded' if STATE_SLICE is not None else 'included'}\n"
+)
 sys.stderr.flush()
 
 _in = sys.stdin.buffer
@@ -59,8 +110,10 @@ def _action_to_numpy(action):
     if isinstance(action, dict):
         action = action[ACTION]
     action_np = action.squeeze(0).float().cpu().numpy().reshape(-1)
-    if action_np.shape != (14,):
-        raise RuntimeError(f"expected 14-D pi0.5 action, got shape {action_np.shape}")
+    if action_np.shape != (ACTION_DIM,):
+        raise RuntimeError(
+            f"expected {ACTION_DIM}-D pi0.5 action, got shape {action_np.shape}"
+        )
     if not np.isfinite(action_np).all():
         raise RuntimeError("pi0.5 action contains non-finite values")
     return action_np
@@ -180,7 +233,9 @@ while True:
     queued_actions_remaining = 0
 
     obs = {
-        "observation.state": torch.as_tensor(msg["state"], dtype=torch.float32),
+        "observation.state": torch.as_tensor(
+            _adapt_state(msg["state"]), dtype=torch.float32
+        ),
         "observation.images.head": _img(msg["head"]),
         "observation.images.left_hand": _img(msg["left"]),
         "observation.images.right_hand": _img(msg["right"]),

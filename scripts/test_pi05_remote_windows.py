@@ -143,8 +143,10 @@ def main():
             )
             reply = _recv_with_timeout(proc, args.timeout)
             action = np.asarray(reply["action"], dtype=np.float32)
-            if action.shape != (14,):
-                raise RuntimeError(f"expected action shape (14,), got {action.shape}")
+            if action.shape not in {(7,), (14,)}:
+                raise RuntimeError(
+                    f"expected action shape (7,) or (14,), got {action.shape}"
+                )
             if not np.isfinite(action).all():
                 raise RuntimeError(f"action contains non-finite values: {action}")
     except BaseException as exc:
@@ -159,7 +161,7 @@ def main():
         _close_process(proc)
 
     print(f"remote pi0.5 smoke test passed (checkpoint={checkpoint})")
-    print("action shape: (14,), all finite: true")
+    print(f"action shape: {action.shape}, all finite: true")
     print(f"log file: {log_path}")
 
 

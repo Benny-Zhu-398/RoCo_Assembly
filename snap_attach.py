@@ -14,6 +14,8 @@ connector / pin / rod parts.
 """
 
 import math
+import numpy as np
+from scipy.spatial.transform import Rotation
 from pxr import Usd, UsdGeom, UsdPhysics, Gf, Sdf
 
 
@@ -237,6 +239,8 @@ class SnapAttacher:
                                           # in target's local frame on top
                                           # of connect_offset_pos. Same
                                           # gating as above.
+        part_name=None,                    # logical PART_CONFIG key; used to
+                                          # guard residual-RL error queries.
     ):
         if target_rot is None:
             target_rot = _quat(0.5, 0.5, -0.5, -0.5)
@@ -265,6 +269,7 @@ class SnapAttacher:
                                    if connect_offset_pos is not None else None)
         self.connect_offset_rot = (Gf.Quatd(connect_offset_rot).GetNormalized()
                                    if connect_offset_rot is not None else None)
+        self.part_name = None if part_name is None else str(part_name)
         self.attached = False
         self._tick = 0
         self._resolved_movable = None    # set lazily on first update()
@@ -278,6 +283,11 @@ class SnapAttacher:
         self._post_baseline_mesh = None
         self._post_baseline_body = None
         self._post_tick = 0
+        # Exact error evaluated by the most recent update(). Keep the
+        # pre-attachment value after a snap: connect_pos may intentionally
+        # differ from target_pos, so recomputing after authoring the joint
+        # would lose the error that actually passed the gate.
+        self._last_se3_error = None
 
     # --- internals --------------------------------------------------------
 
@@ -317,6 +327,127 @@ class SnapAttacher:
     def _target_world_matrix(self):
         return build_world_matrix(self.target_pos, self.target_rot)
 
+    @staticmethod
+    def _rotation_from_matrix(matrix):
+        quat = matrix.ExtractRotationQuat().GetNormalized()
+        imag = quat.GetImaginary()
+        return Rotation.from_quat(
+            [float(imag[0]), float(imag[1]), float(imag[2]), float(quat.GetReal())]
+        )
+
+    def _compute_se3_error(self):
+        self._resolve_paths()
+        if not self._resolved_mesh:
+            raise RuntimeError(
+                f"no movable mesh resolved for part {self.part_name!r} "
+                f"under {self.movable_path!r}"
+            )
+        m_cur = _world_xform(self.stage, self._resolved_mesh)
+        m_tgt = self._target_world_matrix()
+        p_cur = np.asarray(m_cur.ExtractTranslation(), dtype=np.float64)
+        p_tgt = np.asarray(m_tgt.ExtractTranslation(), dtype=np.float64)
+        current_rotation = self._rotation_from_matrix(m_cur)
+        target_rotation = self._rotation_from_matrix(m_tgt)
+        # World-frame correction: R_error * R_current = R_target. This is
+        # the same left-multiplication convention as ResidualInjector.
+        rotation_error = target_rotation * current_rotation.inv()
+        return np.concatenate([p_tgt - p_cur, rotation_error.as_rotvec()])
+
+    def _check_part_name(self, part_name):
+        requested = str(part_name)
+        if self.part_name is not None and requested != self.part_name:
+            raise ValueError(
+                f"SnapAttacher is bound to part {self.part_name!r}, "
+                f"not {requested!r}"
+            )
+
+    def get_se3_error(self, part_name):
+        """Return the latest exact world-frame target-minus-current error.
+
+        The result is ``[position_error(3), rotation_vector_error(3)]``.
+        Once ``update()`` has evaluated the snap gate, this returns that
+        physics step's cached error. In particular, the snap-triggering
+        error remains available after the joint moves the body to its
+        configured connection pose.
+        """
+        self._check_part_name(part_name)
+        if self._last_se3_error is None:
+            return self._compute_se3_error()
+        return self._last_se3_error.copy()
+
+    def get_current_pose(self, part_name):
+        """Return the movable mesh world pose as ``[xyz, qw, qx, qy, qz]``.
+
+        This is intentionally the same visible-mesh frame used by the snap
+        gate and residual SE(3) error, rather than the possibly offset rigid
+        body frame.
+        """
+        self._check_part_name(part_name)
+        self._resolve_paths()
+        if not self._resolved_mesh:
+            raise RuntimeError(
+                f"no movable mesh resolved for part {self.part_name!r} "
+                f"under {self.movable_path!r}"
+            )
+        matrix = _world_xform(self.stage, self._resolved_mesh)
+        position = np.asarray(matrix.ExtractTranslation(), dtype=np.float64)
+        quat = matrix.ExtractRotationQuat().GetNormalized()
+        imag = quat.GetImaginary()
+        return np.concatenate(
+            [
+                position,
+                [
+                    float(quat.GetReal()),
+                    float(imag[0]),
+                    float(imag[1]),
+                    float(imag[2]),
+                ],
+            ]
+        )
+
+    def get_resolved_rigid_body_path(self, part_name):
+        """Return the rigid-body prim path used for contact telemetry."""
+        self._check_part_name(part_name)
+        self._resolve_paths()
+        if not self._resolved_movable:
+            raise RuntimeError(
+                f"no rigid body resolved for part {self.part_name!r} "
+                f"under {self.movable_path!r}"
+            )
+        return self._resolved_movable
+
+    def get_normalized_error(self, part_name):
+        """Return ``[ex/tx, ey/ty, ez/tz, ||rotvec||/rot_tol]``.
+
+        The thresholds are the values supplied from the part's
+        ``param_config.py`` snap configuration by ``build_snap_attacher``.
+        A negative rotation tolerance disables that gate, so its normalized
+        error is defined as zero.
+        """
+        error = self.get_se3_error(part_name)
+        if self.pos_tol_axes is None:
+            position_tolerance = np.full(3, self.pos_tol, dtype=np.float64)
+        else:
+            position_tolerance = np.asarray(self.pos_tol_axes, dtype=np.float64)
+        if np.any(position_tolerance <= 0.0):
+            raise ValueError(
+                f"position tolerances must be positive for part {part_name!r}"
+            )
+        if self.rot_tol_deg < 0.0:
+            normalized_rotation = 0.0
+        else:
+            rotation_tolerance = math.radians(self.rot_tol_deg)
+            if rotation_tolerance <= 0.0:
+                raise ValueError(
+                    f"rotation tolerance must be positive for part {part_name!r}"
+                )
+            normalized_rotation = float(
+                np.linalg.norm(error[3:]) / rotation_tolerance
+            )
+        return np.concatenate(
+            [error[:3] / position_tolerance, [normalized_rotation]]
+        )
+
     def _snap_pose(self, m_tgt):
         snap_to_pose(self.stage, self._resolved_movable, m_tgt,
                      set_kinematic=self.set_kinematic_on_snap)
@@ -329,6 +460,8 @@ class SnapAttacher:
         cp = m_cur.ExtractTranslation()
         cq = m_cur.ExtractRotationQuat().GetNormalized()
         tq = self.target_rot
+        se3_error = self.get_se3_error(self.part_name)
+        normalized_error = self.get_normalized_error(self.part_name)
         if dp is not None:
             ax = self.pos_tol_axes
             pos_str = (f"dx={dp[0]*1000:+6.2f}[<{ax[0]*1000:.1f}] "
@@ -349,6 +482,13 @@ class SnapAttacher:
             f"wxyz=({cq.GetReal():+.3f},{cq.GetImaginary()[0]:+.3f},{cq.GetImaginary()[1]:+.3f},{cq.GetImaginary()[2]:+.3f})  "
             f"tgt=({self.target_pos[0]:+.4f},{self.target_pos[1]:+.4f},{self.target_pos[2]:+.4f}) "
             f"wxyz=({tq.GetReal():+.3f},{tq.GetImaginary()[0]:+.3f},{tq.GetImaginary()[1]:+.3f},{tq.GetImaginary()[2]:+.3f})"
+        )
+        print(
+            f"[snap.se3] part={self.part_name or '<unbound>'} tick={self._tick:5d} "
+            f"error={np.array2string(se3_error, precision=12, separator=',', max_line_width=1000)} "
+            f"normalized={np.array2string(normalized_error, precision=12, separator=',', max_line_width=1000)} "
+            f"pos_ok={int(pos_ok)} rot_ok={int(rot_ok)}",
+            flush=True,
         )
 
     # --- public -----------------------------------------------------------
@@ -406,12 +546,17 @@ class SnapAttacher:
         # sit at a different world pose because of a body↔mesh local xform.
         m_cur = _world_xform(self.stage, self._resolved_mesh)
         m_tgt = self._target_world_matrix()
-        pos_err, rot_err = _pose_error(m_cur, m_tgt)
+        se3_error = self._compute_se3_error()
+        self._last_se3_error = se3_error.copy()
+        pos_err = float(np.linalg.norm(se3_error[:3]))
+        rot_err = math.degrees(float(np.linalg.norm(se3_error[3:])))
 
         # Position gate: per-axis in WORLD frame if pos_tol_axes set, else
         # scalar Euclidean.
         if self.pos_tol_axes is not None:
-            dp = m_cur.ExtractTranslation() - m_tgt.ExtractTranslation()
+            # Legacy debug output is current-minus-target. The residual-RL
+            # query deliberately uses the opposite, corrective sign.
+            dp = -se3_error[:3]
             pos_ok = (abs(dp[0]) < self.pos_tol_axes[0]
                       and abs(dp[1]) < self.pos_tol_axes[1]
                       and abs(dp[2]) < self.pos_tol_axes[2])

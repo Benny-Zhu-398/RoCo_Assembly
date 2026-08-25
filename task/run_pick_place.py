@@ -56,6 +56,7 @@ simulation_app = SimulationApp(_SIM_CONFIG)
 import argparse
 import importlib
 import json
+import math
 import numpy as np
 
 import param_config as pc
@@ -265,6 +266,7 @@ def build_snap_attacher(stage, part_name, snap_cfg):
     connect_offset_rot_tup = snap_cfg.get("connect_offset_rot")
     connect_offset_rot = (_quat(*connect_offset_rot_tup)
                           if connect_offset_rot_tup is not None else None)
+    debug_every_override = os.environ.get("ROCO_SNAP_DEBUG_EVERY")
     return SnapAttacher(
         stage,
         movable_path=snap_cfg["movable_path"],
@@ -276,8 +278,11 @@ def build_snap_attacher(stage, part_name, snap_cfg):
         rot_tol_deg=snap_cfg.get("rot_tol_deg", 5.0),
         joint_path=snap_cfg.get("joint_path",
                                 f"/World/_snap_joint_{part_name}"),
-        debug=snap_cfg.get("debug", False),
-        debug_every=snap_cfg.get("debug_every", 30),
+        debug=(snap_cfg.get("debug", False)
+               or debug_every_override is not None),
+        debug_every=(snap_cfg.get("debug_every", 30)
+                     if debug_every_override is None
+                     else int(debug_every_override)),
         set_kinematic_on_snap=snap_cfg.get("set_kinematic", False),
         mesh_path=snap_cfg.get("mesh_path"),
         author_joint_on_snap=snap_cfg.get("author_joint", True),
@@ -285,6 +290,7 @@ def build_snap_attacher(stage, part_name, snap_cfg):
         connect_rot=connect_rot,
         connect_offset_pos=snap_cfg.get("connect_offset_pos"),
         connect_offset_rot=connect_offset_rot,
+        part_name=part_name,
     )
 
 
@@ -776,6 +782,116 @@ def _parse_args():
         help="Update the policy at this simulated-time frequency and hold the "
              "last articulation target between updates.",
     )
+    parser.add_argument(
+        "--residual-random-eval",
+        action="store_true",
+        help="Run the Gym-style ResidualEnv on the single part selected by "
+             "ROCO_PART_ORDER.",
+    )
+    parser.add_argument(
+        "--residual-td3-train",
+        action="store_true",
+        help="Train and periodically evaluate TD3 on the selected ResidualEnv task.",
+    )
+    parser.add_argument(
+        "--residual-task",
+        default="snap_insertion",
+        help="Registered ResidualTask factory (default: snap_insertion).",
+    )
+    parser.add_argument(
+        "--residual-reward",
+        default="bounded_snap",
+        help="Registered residual reward factory (default: bounded_snap).",
+    )
+    parser.add_argument(
+        "--residual-episodes",
+        type=int,
+        default=10,
+        help="Number of random ResidualEnv episodes (default: 10).",
+    )
+    parser.add_argument(
+        "--residual-env-max-steps",
+        type=int,
+        default=64,
+        help="Maximum residual actions per episode (default: 64).",
+    )
+    parser.add_argument(
+        "--residual-prefix-horizon",
+        type=int,
+        default=16,
+        help="BC chunk horizon used only during reset prefix replay (default: 16).",
+    )
+    parser.add_argument(
+        "--residual-max-reset-attempts",
+        type=int,
+        default=50,
+        help="Maximum BC prefix attempts within one residual episode. Set to "
+             "1 when every reset must count as an evaluation trial.",
+    )
+    parser.add_argument(
+        "--residual-seed",
+        type=int,
+        default=0,
+        help="Random-action seed for ResidualEnv validation.",
+    )
+    parser.add_argument(
+        "--residual-action-mode",
+        choices=("random", "zero", "fixed-x"),
+        default="random",
+        help="Residual validation action source (default: random).",
+    )
+    parser.add_argument(
+        "--residual-fixed-x",
+        type=float,
+        default=-1.0,
+        help="X action used by --residual-action-mode=fixed-x (default: -1).",
+    )
+    parser.add_argument(
+        "--residual-delta-max-pos",
+        type=float,
+        default=0.005,
+        help="Residual position L2 limit in metres (default: 0.005).",
+    )
+    parser.add_argument(
+        "--residual-delta-max-ori-deg",
+        type=float,
+        default=30.0,
+        help="Residual orientation geodesic limit in degrees (default: 30).",
+    )
+    parser.add_argument(
+        "--residual-gate-enter-ori-deg",
+        type=float,
+        default=45.0,
+        help="Residual gate orientation admission threshold in degrees "
+             "(default: 45).",
+    )
+    parser.add_argument(
+        "--residual-smooth-weight",
+        type=float,
+        default=1.0,
+        help="Penalty weight for the executed residual norm (default: 1.0).",
+    )
+    parser.add_argument(
+        "--residual-log",
+        default="artifacts/residual_env_random_eval.jsonl",
+        help="JSONL path for random ResidualEnv validation telemetry.",
+    )
+    parser.add_argument("--td3-train-episodes", type=int, default=200)
+    parser.add_argument("--td3-warmup-steps", type=int, default=1000)
+    parser.add_argument("--td3-batch-size", type=int, default=256)
+    parser.add_argument("--td3-buffer-capacity", type=int, default=100_000)
+    parser.add_argument("--td3-eval-interval", type=int, default=50)
+    parser.add_argument("--td3-eval-episodes", type=int, default=30)
+    parser.add_argument("--td3-exploration-noise", type=float, default=0.03)
+    parser.add_argument("--td3-device", default="cpu")
+    parser.add_argument(
+        "--td3-log",
+        default="artifacts/residual_td3_training.jsonl",
+    )
+    parser.add_argument(
+        "--td3-checkpoint-dir",
+        default="artifacts/residual_td3_checkpoints",
+    )
     # SimulationApp consumes argv too; tolerate unknown args so the runner
     # can be launched as ${ISAAC_SIM}/python.sh run_pick_place.py --policy ...
     args = parser.parse_known_args()[0]
@@ -789,6 +905,8 @@ def _parse_args():
     )
     if diagnostic_mode_count > 1:
         parser.error("pi0.5 dry-run diagnostic modes are mutually exclusive")
+    if args.residual_random_eval and args.residual_td3_train:
+        parser.error("residual evaluation and TD3 training modes are mutually exclusive")
     if args.policy_control_hz is not None and args.policy_control_hz <= 0:
         parser.error("--policy-control-hz must be positive")
     if args.pi05_continuous_episode:
@@ -798,6 +916,32 @@ def _parse_args():
             args.policy_control_hz = 10.0
     if args.record_video_deferred and not args.record_video:
         parser.error("--record-video-deferred requires --record-video")
+    if (
+        args.residual_episodes <= 0
+        or args.residual_env_max_steps <= 0
+        or args.residual_prefix_horizon <= 0
+        or args.residual_max_reset_attempts <= 0
+        or args.residual_delta_max_pos <= 0.0
+        or args.residual_delta_max_ori_deg <= 0.0
+        or not 0.0 < args.residual_gate_enter_ori_deg < 60.0
+        or args.residual_smooth_weight < 0.0
+    ):
+        parser.error(
+            "residual counts/limits must be positive, smooth weight non-negative, "
+            "and gate-enter orientation must lie in (0, 60) degrees"
+        )
+    if not -1.0 <= args.residual_fixed_x <= 1.0:
+        parser.error("--residual-fixed-x must lie in [-1, 1]")
+    if (
+        args.td3_train_episodes <= 0
+        or args.td3_warmup_steps < 0
+        or args.td3_batch_size <= 0
+        or args.td3_buffer_capacity < args.td3_batch_size
+        or args.td3_eval_interval <= 0
+        or args.td3_eval_episodes <= 0
+        or args.td3_exploration_noise < 0.0
+    ):
+        parser.error("TD3 counts/noise must be valid and buffer >= batch size")
     for attr in ("max_steps", "max_sim_seconds", "max_parts"):
         value = getattr(args, attr, None)
         if value is not None and value <= 0:
@@ -808,6 +952,9 @@ def _parse_args():
         "pi05_dry_run_log",
         "pi05_ik_dry_run_log",
         "pi05_five_request_log",
+        "residual_log",
+        "td3_log",
+        "td3_checkpoint_dir",
     ):
         value = getattr(args, attr, None)
         if value and not os.path.isabs(value):
@@ -837,9 +984,42 @@ def _load_policy_class(dotted_path: str):
 
 def main():
     args = _parse_args()
+    residual_workflow = args.residual_random_eval or args.residual_td3_train
+    residual_part_name = None
+    if residual_workflow:
+        if len(pc.part_order) != 1:
+            raise ValueError(
+                "residual workflows require exactly one ROCO_PART_ORDER part"
+            )
+        residual_part_name = pc.part_order[0]
+        residual_part_cfg = pc.get_part_config(residual_part_name)
+        if args.residual_task == "snap_insertion" and not residual_part_cfg.get("snap"):
+            raise ValueError(
+                f"residual workflows require a snap-configured part, got "
+                f"{residual_part_name!r}"
+            )
     pi05_policy_enabled = args.policy.endswith(".Pi05LeRobotPolicy")
+    residual_policy_enabled = any(
+        args.policy.endswith(suffix)
+        for suffix in (
+            ".Pi05LeRobotPolicy",
+            ".DiffusionLeRobotPolicy",
+            ".DiffusionStateOnlyPolicy",
+        )
+    )
+    if residual_workflow and not residual_policy_enabled:
+        raise ValueError(
+            "residual workflows require Pi05LeRobotPolicy, "
+            "DiffusionLeRobotPolicy, or DiffusionStateOnlyPolicy"
+        )
+    if residual_workflow and pi05_policy_enabled:
+        os.environ["PI05_EXEC_HORIZON"] = "1"
+        os.environ["PI05_SAFETY_FILTER"] = "0"
+        # Checkpoints were trained with the literal LeRobot part name as task
+        # label.  Preserve an explicit caller override for prompt ablations.
+        os.environ.setdefault("PI05_TASK", residual_part_name)
     fix_task_board_enabled = (
-        pi05_policy_enabled
+        residual_policy_enabled
         if args.fix_task_board is None
         else bool(args.fix_task_board)
     )
@@ -1313,14 +1493,843 @@ def main():
         else:
             _start_next_part()
 
-    _restart_iteration()
-    if auto_play:
+    def _run_residual_workflow():
+        from policies.residual_injector import ResidualInjector
+        from residual_env import ResidualEnv, ResidualEnvConfig
+        from residual_isaac_backend import IsaacResidualBackend
+        from residual_policy import make_residual_policy_adapter
+        from residual_task import (
+            BoundedSnapRewardConfig,
+            SnapInsertionTaskConfig,
+            make_residual_reward,
+            make_residual_task,
+        )
+
+        policy_adapter = make_residual_policy_adapter(policy)
+
+        control_hz = float(args.policy_control_hz or 10.0)
+        # ``World.step`` advances one rendering interval, not one raw PhysX
+        # substep.  This world renders at 10 Hz while PhysX substeps at 200 Hz,
+        # so using ``env_info.physics_dt`` here would accidentally hold every
+        # policy target for 20 rendering frames (2 seconds at the default
+        # control rate).
+        rendering_dt = float(my_world.get_rendering_dt())
+        render_steps_per_action = max(1, int(round(1.0 / (control_hz * rendering_dt))))
+        contact_view = None
+        contact_view_error = None
+
+        def reset_episode(part_name):
+            nonlocal fixed_head_camera_ready, contact_view, contact_view_error
+            if part_name != residual_part_name:
+                raise ValueError(
+                    f"residual target mismatch: {part_name!r} != "
+                    f"{residual_part_name!r}"
+                )
+            contact_view = None
+            contact_view_error = None
+            _clear_snap_state()
+            try:
+                my_world.stop()
+            except Exception:
+                pass
+            my_world.reset()
+            _apply_init_joint_targets()
+            L_controller.reset()
+            R_controller.reset()
+            _restart_iteration()
+            my_world.play()
+
+            # The task scene has no pre-authored contact sensor.  Create a
+            # force view for stuck-event diagnostics after the selected
+            # rigid body has been restored and the physics timeline restarted.
+            try:
+                from isaacsim.core.prims import RigidPrim
+
+                rigid_body_path = (
+                    current_snap_attacher.get_resolved_rigid_body_path(part_name)
+                )
+                contact_view = RigidPrim(
+                    prim_paths_expr=rigid_body_path,
+                    name=f"residual_{part_name}_contact_view",
+                    track_contact_forces=True,
+                    prepare_contact_sensors=True,
+                )
+                contact_view.initialize()
+            except Exception as exc:
+                contact_view = None
+                contact_view_error = f"{type(exc).__name__}: {exc}"
+                print(
+                    f"[residual.eval] contact-force telemetry unavailable: "
+                    f"{contact_view_error}",
+                    flush=True,
+                )
+
+            warmup_steps = int(getattr(pc, "WARMUP_STEPS", 0))
+            for _ in range(warmup_steps):
+                _apply_init_joint_targets()
+                if fixed_head_camera_enabled:
+                    sync_fixed_camera_to_source(
+                        head_depth_camera,
+                        "/World/robotics/vega_1u_gripper/zed_depth_frame/headcam",
+                    )
+                my_world.step(render=True)
+            if fixed_head_camera_enabled:
+                sync_fixed_camera_to_source(
+                    head_depth_camera,
+                    "/World/robotics/vega_1u_gripper/zed_depth_frame/headcam",
+                )
+                fixed_head_camera_ready = True
+                my_world.step(render=True)
+
+        def get_attacher(part_name):
+            if part_name != current_part:
+                return None
+            return current_snap_attacher
+
+        def apply_cartesian_action(position, quaternion_wxyz, gripper):
+            L_action = policy.L.forward(
+                np.asarray(position, dtype=np.float64),
+                np.asarray(quaternion_wxyz, dtype=np.float64),
+                float(np.clip(gripper, 0.0, 0.6649704)),
+            )
+            articulation_controller.apply_action(_merge_left_with_right_hold(L_action))
+
+        def advance():
+            for render_step in range(render_steps_per_action):
+                my_world.step(render=(render_step == render_steps_per_action - 1))
+
+        def get_contact_force(part_name):
+            del part_name
+            if contact_view is None:
+                return None
+            try:
+                forces = contact_view.get_net_contact_forces(
+                    dt=float(env_info.physics_dt)
+                )
+                if hasattr(forces, "cpu"):
+                    forces = forces.cpu()
+                if hasattr(forces, "numpy"):
+                    forces = forces.numpy()
+                array = np.asarray(forces, dtype=np.float64).reshape(-1, 3)
+                return array[0].copy() if len(array) else None
+            except Exception as exc:
+                print(
+                    f"[residual.eval] contact-force query failed: "
+                    f"{type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+                return None
+
+        backend = IsaacResidualBackend(
+            policy_adapter=policy_adapter,
+            reset_episode=reset_episode,
+            get_observation=_build_observation,
+            get_attacher=get_attacher,
+            apply_cartesian_action=apply_cartesian_action,
+            advance=advance,
+            get_contact_force=get_contact_force,
+            prefix_exec_horizon=args.residual_prefix_horizon,
+            part_config_provider=pc.get_part_config,
+        )
+        residual_part_cfg = pc.get_part_config(residual_part_name)
+        residual_config_kwargs = {}
+        task_config = None
+        if args.residual_task == "snap_insertion":
+            residual_snap_cfg = residual_part_cfg["snap"]
+            if float(residual_snap_cfg.get("rot_tol_deg", 5.0)) < 0.0:
+                # Axis-symmetric parts deliberately disable the snap orientation
+                # gate.  Their full SO(3) error contains an irrelevant axial
+                # rotation, so it must not reject or exit the residual window.
+                residual_config_kwargs.update(
+                    gate_enter_ori_rad=math.pi + 1e-6,
+                    gate_exit_ori_rad=math.pi + 2e-6,
+                )
+            else:
+                residual_config_kwargs.update(
+                    gate_enter_ori_rad=math.radians(
+                        args.residual_gate_enter_ori_deg
+                    ),
+                )
+            task_config = SnapInsertionTaskConfig(
+                target_name=residual_part_name,
+                gate_enter_ori_rad=residual_config_kwargs.get(
+                    "gate_enter_ori_rad", math.radians(45.0)
+                ),
+                gate_exit_ori_rad=residual_config_kwargs.get(
+                    "gate_exit_ori_rad", math.radians(60.0)
+                ),
+            )
+        if args.residual_reward == "bounded_snap":
+            reward = make_residual_reward(
+                args.residual_reward,
+                config=BoundedSnapRewardConfig(
+                    w_pos=1.0,
+                    w_ori=1.0,
+                    smooth_weight=args.residual_smooth_weight,
+                ),
+            )
+        else:
+            reward = make_residual_reward(args.residual_reward)
+        if args.residual_task == "snap_insertion":
+            residual_task = make_residual_task(
+                args.residual_task,
+                config=task_config,
+                reward=reward,
+            )
+        else:
+            residual_task = make_residual_task(
+                args.residual_task,
+                target_name=residual_part_name,
+                part_config=residual_part_cfg,
+                reward=reward,
+            )
+        env_config = ResidualEnvConfig(
+            part_name=residual_part_name,
+            physical_obs_dim=policy_adapter.observation_dim,
+            w_pos=1.0,
+            w_ori=1.0,
+            smooth_weight=args.residual_smooth_weight,
+            max_steps=args.residual_env_max_steps,
+            max_reset_attempts=args.residual_max_reset_attempts,
+            **residual_config_kwargs,
+        )
+        residual_env = ResidualEnv(
+            backend,
+            env_config,
+            injector=ResidualInjector(
+                delta_max_pos=args.residual_delta_max_pos,
+                delta_max_ori=math.radians(args.residual_delta_max_ori_deg),
+            ),
+            task=residual_task,
+        )
+
+        if args.residual_td3_train:
+            from residual_td3 import ReplayBuffer, TD3, TD3Config
+
+            def wilson_interval(successes, trials, z=1.959963984540054):
+                if trials <= 0:
+                    return 0.0, 1.0
+                probability = successes / trials
+                denominator = 1.0 + z * z / trials
+                center = (
+                    probability + z * z / (2.0 * trials)
+                ) / denominator
+                half_width = z / denominator * math.sqrt(
+                    probability * (1.0 - probability) / trials
+                    + z * z / (4.0 * trials * trials)
+                )
+                return center - half_width, center + half_width
+
+            td3_config = TD3Config(
+                gamma=0.99,
+                tau=0.005,
+                learning_rate=3e-4,
+                policy_freq=2,
+            )
+            agent = TD3(
+                observation_dim=residual_env.observation_space.shape[0],
+                action_dim=6,
+                config=td3_config,
+                device=args.td3_device,
+                seed=args.residual_seed,
+            )
+            replay_buffer = ReplayBuffer(
+                observation_dim=residual_env.observation_space.shape[0],
+                action_dim=6,
+                capacity=args.td3_buffer_capacity,
+                seed=args.residual_seed,
+            )
+            rng = np.random.default_rng(args.residual_seed)
+            os.makedirs(os.path.dirname(args.td3_log) or ".", exist_ok=True)
+            os.makedirs(args.td3_checkpoint_dir, exist_ok=True)
+            total_steps = 0
+            training_done_reasons = {}
+
+            def run_evaluation(marker_episode, log_file):
+                successes = 0
+                reasons = {}
+                returns = []
+                steps = []
+                for eval_episode in range(1, args.td3_eval_episodes + 1):
+                    observation, _ = residual_env.reset(
+                        seed=(
+                            args.residual_seed
+                            + 1_000_000
+                            + marker_episode * 1000
+                            + eval_episode
+                        )
+                    )
+                    episode_return = 0.0
+                    while True:
+                        action = agent.select_action(observation)
+                        (
+                            next_observation,
+                            reward,
+                            terminated,
+                            truncated,
+                            info,
+                        ) = residual_env.step(action)
+                        episode_return += reward
+                        observation = next_observation
+                        if terminated or truncated:
+                            break
+                    reason = info["done_reason"]
+                    reasons[reason] = reasons.get(reason, 0) + 1
+                    successes += int(reason == residual_task.success_reason)
+                    returns.append(episode_return)
+                    steps.append(info["rl_steps"])
+                    record = {
+                        "type": "evaluation_episode",
+                        "training_episode": marker_episode,
+                        "evaluation_episode": eval_episode,
+                        "return": episode_return,
+                        "steps": info["rl_steps"],
+                        "done_reason": reason,
+                    }
+                    log_file.write(json.dumps(record) + "\n")
+                    log_file.flush()
+                    print(
+                        f"[residual.td3.eval.episode] "
+                        f"train_episode={marker_episode} "
+                        f"episode={eval_episode:02d}/"
+                        f"{args.td3_eval_episodes} "
+                        f"return={episode_return:+.3f} "
+                        f"steps={info['rl_steps']:02d} "
+                        f"done={reason}",
+                        flush=True,
+                    )
+
+                interval_low, interval_high = wilson_interval(
+                    successes, args.td3_eval_episodes
+                )
+                summary = {
+                    "type": "evaluation_summary",
+                    "training_episode": marker_episode,
+                    "episodes": args.td3_eval_episodes,
+                    "success_count": successes,
+                    "success_rate": successes / args.td3_eval_episodes,
+                    "success_reason": residual_task.success_reason,
+                    # Compatibility aliases used by HDMI telemetry tools.
+                    "snap_count": successes,
+                    "snap_rate": successes / args.td3_eval_episodes,
+                    "wilson_95_low": interval_low,
+                    "wilson_95_high": interval_high,
+                    "done_reasons": reasons,
+                    "mean_return": float(np.mean(returns)),
+                    "mean_steps": float(np.mean(steps)),
+                    "total_steps": total_steps,
+                }
+                log_file.write(json.dumps(summary) + "\n")
+                log_file.flush()
+                checkpoint_path = os.path.join(
+                    args.td3_checkpoint_dir,
+                    f"td3_episode_{marker_episode:04d}.pt",
+                )
+                agent.save(checkpoint_path, metadata=summary)
+                print(
+                    f"[residual.td3.eval] train_episode={marker_episode} "
+                    f"snap={successes}/{args.td3_eval_episodes} "
+                    f"rate={summary['snap_rate']:.3f} "
+                    f"wilson95=[{interval_low:.3f},{interval_high:.3f}] "
+                    f"reasons={reasons}",
+                    flush=True,
+                )
+                return summary
+
+            with open(args.td3_log, "w", encoding="utf-8") as log_file:
+                configuration = {
+                    "type": "configuration",
+                    "algorithm": "TD3",
+                    "base_policy_adapter": policy_adapter.name,
+                    "residual_task": residual_task.name,
+                    "residual_reward": args.residual_reward,
+                    "observation_dim": residual_env.observation_space.shape[0],
+                    "train_episodes": args.td3_train_episodes,
+                    "warmup_steps": args.td3_warmup_steps,
+                    "warmup_distribution": "normal",
+                    "exploration_noise": args.td3_exploration_noise,
+                    "batch_size": args.td3_batch_size,
+                    "buffer_capacity": args.td3_buffer_capacity,
+                    "eval_interval": args.td3_eval_interval,
+                    "eval_episodes": args.td3_eval_episodes,
+                    "delta_max_pos": args.residual_delta_max_pos,
+                    "delta_max_ori_rad": math.radians(
+                        args.residual_delta_max_ori_deg
+                    ),
+                    "residual_env": {
+                        "max_steps": residual_env.config.max_steps,
+                        "gate_enter_pos_m": residual_env.config.gate_enter_pos_m,
+                        "gate_exit_pos_m": residual_env.config.gate_exit_pos_m,
+                        "gate_enter_ori_rad": residual_env.config.gate_enter_ori_rad,
+                        "gate_exit_ori_rad": residual_env.config.gate_exit_ori_rad,
+                        "smooth_weight": residual_env.config.smooth_weight,
+                        "terminal_reward": residual_env.config.terminal_reward,
+                        "gate_exit_reward": residual_env.config.gate_exit_reward,
+                        "stuck_reward": residual_env.config.stuck_reward,
+                    },
+                    "base_policy_task": os.environ.get(
+                        "PI05_TASK", residual_part_name
+                    ),
+                    "td3": {
+                        "gamma": td3_config.gamma,
+                        "tau": td3_config.tau,
+                        "learning_rate": td3_config.learning_rate,
+                        "policy_freq": td3_config.policy_freq,
+                        "policy_noise": td3_config.policy_noise,
+                        "noise_clip": td3_config.noise_clip,
+                        "hidden_dim": td3_config.hidden_dim,
+                        "hidden_layers": td3_config.hidden_layers,
+                    },
+                }
+                log_file.write(json.dumps(configuration) + "\n")
+
+                for training_episode in range(1, args.td3_train_episodes + 1):
+                    observation, reset_info = residual_env.reset(
+                        seed=args.residual_seed + training_episode
+                    )
+                    episode_return = 0.0
+                    critic_losses = []
+                    actor_losses = []
+                    while True:
+                        if total_steps < args.td3_warmup_steps:
+                            action = rng.normal(
+                                0.0, args.td3_exploration_noise, size=6
+                            )
+                            action_source = "warmup_normal"
+                        else:
+                            action = agent.select_action(observation)
+                            action += rng.normal(
+                                0.0, args.td3_exploration_noise, size=6
+                            )
+                            action_source = "actor_plus_normal"
+                        action = np.clip(action, -1.0, 1.0)
+                        (
+                            next_observation,
+                            reward,
+                            terminated,
+                            truncated,
+                            info,
+                        ) = residual_env.step(action)
+                        episode_done = bool(terminated or truncated)
+                        replay_buffer.add(
+                            observation,
+                            action,
+                            next_observation,
+                            reward,
+                            episode_done,
+                        )
+                        observation = next_observation
+                        episode_return += reward
+                        total_steps += 1
+
+                        # TD3 warm-up is data collection only.  Starting
+                        # gradient updates as soon as one batch is available
+                        # would train the actor on a small, strongly biased
+                        # prefix of the replay buffer while actions are still
+                        # labeled as warm-up exploration.
+                        if (
+                            total_steps >= args.td3_warmup_steps
+                            and len(replay_buffer) >= args.td3_batch_size
+                        ):
+                            losses = agent.train(
+                                replay_buffer, batch_size=args.td3_batch_size
+                            )
+                            critic_losses.append(losses["critic_loss"])
+                            if losses["actor_updated"]:
+                                actor_losses.append(losses["actor_loss"])
+                            update_record = {
+                                "type": "update",
+                                "training_episode": training_episode,
+                                "total_steps": total_steps,
+                                "action_source": action_source,
+                                "critic_loss": losses["critic_loss"],
+                                "actor_loss": (
+                                    losses["actor_loss"]
+                                    if losses["actor_updated"]
+                                    else None
+                                ),
+                                "actor_updated": losses["actor_updated"],
+                            }
+                            log_file.write(json.dumps(update_record) + "\n")
+
+                        if episode_done:
+                            break
+
+                    reason = info["done_reason"]
+                    training_done_reasons[reason] = (
+                        training_done_reasons.get(reason, 0) + 1
+                    )
+                    episode_record = {
+                        "type": "training_episode",
+                        "episode": training_episode,
+                        "return": episode_return,
+                        "steps": info["rl_steps"],
+                        "done_reason": reason,
+                        "snap": reason == "snap",
+                        "gate_exit": reason == "gate_exit",
+                        "total_steps": total_steps,
+                        "buffer_size": len(replay_buffer),
+                        "mean_critic_loss": (
+                            float(np.mean(critic_losses))
+                            if critic_losses
+                            else None
+                        ),
+                        "mean_actor_loss": (
+                            float(np.mean(actor_losses))
+                            if actor_losses
+                            else None
+                        ),
+                        "reset_elapsed_s": reset_info["reset_elapsed_s"],
+                    }
+                    log_file.write(json.dumps(episode_record) + "\n")
+                    log_file.flush()
+                    print(
+                        f"[residual.td3.train] episode={training_episode:03d} "
+                        f"steps={info['rl_steps']:02d} return={episode_return:+.3f} "
+                        f"done={reason} buffer={len(replay_buffer)} "
+                        f"critic={episode_record['mean_critic_loss']} "
+                        f"gate_exit_rate="
+                        f"{training_done_reasons.get('gate_exit', 0) / training_episode:.3f}",
+                        flush=True,
+                    )
+
+                    if training_episode % args.td3_eval_interval == 0:
+                        run_evaluation(training_episode, log_file)
+
+                final_record = {
+                    "type": "training_summary",
+                    "episodes": args.td3_train_episodes,
+                    "total_steps": total_steps,
+                    "buffer_size": len(replay_buffer),
+                    "done_reasons": training_done_reasons,
+                    "gate_exit_rate": (
+                        training_done_reasons.get("gate_exit", 0)
+                        / args.td3_train_episodes
+                    ),
+                }
+                log_file.write(json.dumps(final_record) + "\n")
+                log_file.flush()
+                print(
+                    f"[residual.td3] complete={json.dumps(final_record)}",
+                    flush=True,
+                )
+            return
+
+        rng = np.random.default_rng(args.residual_seed)
+        os.makedirs(os.path.dirname(args.residual_log) or ".", exist_ok=True)
+        episode_summaries = []
+        total_bottlenecks = {"x": 0, "y": 0, "z": 0}
+        reset_times = []
+        false_gate_entries = 0
+
+        with open(args.residual_log, "w", encoding="utf-8") as log_file:
+            for episode_index in range(1, args.residual_episodes + 1):
+                rejection_counts_before = dict(residual_env.rejection_reasons)
+                reset_started = time.perf_counter()
+                try:
+                    _, reset_info = residual_env.reset(
+                        seed=args.residual_seed + episode_index
+                    )
+                except RuntimeError as exc:
+                    reset_elapsed_s = time.perf_counter() - reset_started
+                    reset_times.append(reset_elapsed_s)
+                    rejection_delta = {
+                        reason: count - rejection_counts_before.get(reason, 0)
+                        for reason, count in residual_env.rejection_reasons.items()
+                        if count - rejection_counts_before.get(reason, 0) > 0
+                    }
+                    prefix_failure_reason = max(
+                        rejection_delta,
+                        key=rejection_delta.get,
+                        default="prefix_failure",
+                    )
+                    prefix_success = (
+                        prefix_failure_reason
+                        == f"prefix_{residual_task.success_reason}"
+                    )
+                    episode_summary = {
+                        "type": "episode_summary",
+                        "part_name": residual_part_name,
+                        "episode": episode_index,
+                        "action_mode": args.residual_action_mode,
+                        "fixed_x": args.residual_fixed_x,
+                        "delta_max_pos": args.residual_delta_max_pos,
+                        "prefix_steps": None,
+                        "steps": 0,
+                        "done_reason": (
+                            residual_task.success_reason
+                            if prefix_success
+                            else prefix_failure_reason
+                        ),
+                        "return": 100.0 if prefix_success else 0.0,
+                        "dense_return": 0.0,
+                        "terminal_return": 100.0 if prefix_success else 0.0,
+                        "gate_exit_return": 0.0,
+                        "stuck_return": 0.0,
+                        "terminal_dominates_dense": None,
+                        "gate_reactivations": 0,
+                        "bottleneck_counts": {"x": 0, "y": 0, "z": 0},
+                        "reset_elapsed_s": reset_elapsed_s,
+                        "gate_entry_gripper_closed": False,
+                        "gate_entry_part_grasped": False,
+                        "gripper_hold_activated": (
+                            residual_env.last_prefix_hold_activated
+                        ),
+                        "gripper_hold_prefix_step": (
+                            residual_env.last_prefix_hold_step
+                        ),
+                        "reset_error": str(exc),
+                    }
+                    episode_summaries.append(episode_summary)
+                    log_file.write(json.dumps(episode_summary) + "\n")
+                    log_file.flush()
+                    print(
+                        f"[residual.eval] episode={episode_index:02d} "
+                        f"prefix_result={prefix_failure_reason} "
+                        f"elapsed_s={reset_elapsed_s:.3f}",
+                        flush=True,
+                    )
+                    continue
+                reset_times.append(reset_info["reset_elapsed_s"])
+                if not (
+                    reset_info["gate_entry_gripper_closed"]
+                    and reset_info["gate_entry_part_grasped"]
+                ):
+                    false_gate_entries += 1
+                dense_return = 0.0
+                terminal_return = 0.0
+                gate_exit_return = 0.0
+                stuck_return = 0.0
+                episode_return = 0.0
+                episode_bottlenecks = {"x": 0, "y": 0, "z": 0}
+                gate_reactivations = 0
+                saw_inactive_after_entry = False
+
+                while True:
+                    if args.residual_action_mode == "zero":
+                        action = np.zeros(6, dtype=np.float64)
+                    elif args.residual_action_mode == "fixed-x":
+                        action = np.array(
+                            [args.residual_fixed_x, 0.0, 0.0, 0.0, 0.0, 0.0],
+                            dtype=np.float64,
+                        )
+                    else:
+                        action = rng.uniform(-1.0, 1.0, size=6)
+                    _, reward, terminated, truncated, info = residual_env.step(action)
+                    normalized = np.asarray(info["normalized_error"])
+                    dense_reward = sum(
+                        float(value)
+                        for name, value in info["reward_components"].items()
+                        if name not in {"terminal", "gate_exit", "stuck"}
+                    )
+                    dense_return += dense_reward
+                    terminal_return += info["reward_terminal"]
+                    gate_exit_return += info["reward_gate_exit"]
+                    stuck_return += info["reward_stuck"]
+                    episode_return += reward
+                    axis = info["bottleneck_axis"]
+                    episode_bottlenecks[axis] = (
+                        episode_bottlenecks.get(axis, 0) + 1
+                    )
+                    total_bottlenecks[axis] = total_bottlenecks.get(axis, 0) + 1
+                    if not info["gate_active"] and not (terminated or truncated):
+                        saw_inactive_after_entry = True
+                    if saw_inactive_after_entry and info["gate_active"]:
+                        gate_reactivations += 1
+
+                    record = {
+                        "type": "step",
+                        "part_name": residual_part_name,
+                        "episode": episode_index,
+                        "step": info["rl_steps"],
+                        "action_mode": args.residual_action_mode,
+                        "se3_error": np.asarray(info["se3_error"]).tolist(),
+                        "se3_error_delta": np.asarray(
+                            info["se3_error_delta"]
+                        ).tolist(),
+                        "normalized_error": normalized.tolist(),
+                        "gate_active": info["gate_active"],
+                        "reward_position": info["reward_position"],
+                        "reward_orientation": info["reward_orientation"],
+                        "reward_smooth": info["reward_smooth"],
+                        "reward_terminal": info["reward_terminal"],
+                        "reward_gate_exit": info["reward_gate_exit"],
+                        "reward_stuck": info["reward_stuck"],
+                        "reward_components": info["reward_components"],
+                        "reward": reward,
+                        "bottleneck_axis": axis,
+                        "done_reason": info["done_reason"],
+                        "bc_gripper": info["bc_gripper"],
+                        "commanded_gripper": info["commanded_gripper"],
+                        "gripper_override_active": info[
+                            "gripper_override_active"
+                        ],
+                        "measured_gripper_open": info["measured_gripper_open"],
+                        "position_error_change_m": info[
+                            "position_error_change_m"
+                        ],
+                        "stagnant_steps": info["stagnant_steps"],
+                        "contact_force": (
+                            None
+                            if info["contact_force"] is None
+                            else np.asarray(info["contact_force"]).tolist()
+                        ),
+                        "part_pose": (
+                            None
+                            if info["part_pose"] is None
+                            else np.asarray(info["part_pose"]).tolist()
+                        ),
+                    }
+                    log_file.write(json.dumps(record) + "\n")
+                    print(
+                        f"[residual.eval] episode={episode_index:02d} "
+                        f"step={info['rl_steps']:02d} "
+                        f"normalized={np.array2string(normalized, precision=4, separator=',')} "
+                        f"gate={int(info['gate_active'])} "
+                        f"reward_pos={info['reward_position']:+.4f} "
+                        f"reward_ori={info['reward_orientation']:+.4f} "
+                        f"reward_smooth={info['reward_smooth']:+.6f} "
+                        f"reward_stuck={info['reward_stuck']:+.1f} "
+                        f"reward_gate_exit={info['reward_gate_exit']:+.1f} "
+                        f"reward_term={info['reward_terminal']:+.1f} "
+                        f"bottleneck={axis} done={info['done_reason'] or '-'}",
+                        flush=True,
+                    )
+                    if terminated or truncated:
+                        break
+
+                terminal_dominates_dense = (
+                    terminal_return > abs(dense_return)
+                    if terminal_return > 0.0
+                    else None
+                )
+                episode_summary = {
+                    "type": "episode_summary",
+                    "part_name": residual_part_name,
+                    "episode": episode_index,
+                    "action_mode": args.residual_action_mode,
+                    "fixed_x": args.residual_fixed_x,
+                    "delta_max_pos": args.residual_delta_max_pos,
+                    "prefix_steps": reset_info["prefix_steps"],
+                    "steps": info["rl_steps"],
+                    "done_reason": info["done_reason"],
+                    "return": episode_return,
+                    "dense_return": dense_return,
+                    "terminal_return": terminal_return,
+                    "gate_exit_return": gate_exit_return,
+                    "stuck_return": stuck_return,
+                    "terminal_dominates_dense": terminal_dominates_dense,
+                    "gate_reactivations": gate_reactivations,
+                    "bottleneck_counts": episode_bottlenecks,
+                    "reset_elapsed_s": reset_info["reset_elapsed_s"],
+                    "gate_entry_gripper_closed": reset_info[
+                        "gate_entry_gripper_closed"
+                    ],
+                    "gate_entry_part_grasped": reset_info[
+                        "gate_entry_part_grasped"
+                    ],
+                    "gripper_hold_activated": True,
+                    "gripper_hold_prefix_step": reset_info[
+                        "gripper_hold_prefix_step"
+                    ],
+                }
+                episode_summaries.append(episode_summary)
+                log_file.write(json.dumps(episode_summary) + "\n")
+
+            aggregate = {
+                "type": "aggregate_summary",
+                "part_name": residual_part_name,
+                "base_policy_adapter": policy_adapter.name,
+                "residual_task": residual_task.name,
+                "residual_reward": args.residual_reward,
+                "episodes": len(episode_summaries),
+                "action_mode": args.residual_action_mode,
+                "fixed_x": args.residual_fixed_x,
+                "delta_max_pos": args.residual_delta_max_pos,
+                "success_count": sum(
+                    item["done_reason"] == residual_task.success_reason
+                    for item in episode_summaries
+                ),
+                "success_reason": residual_task.success_reason,
+                # Compatibility alias used by existing snap eval scripts.
+                "snap_count": sum(
+                    item["done_reason"] == residual_task.success_reason
+                    for item in episode_summaries
+                ),
+                "gate_exit_count": sum(
+                    item["done_reason"] == "gate_exit" for item in episode_summaries
+                ),
+                "gripper_open_count": sum(
+                    item["done_reason"] == "gripper_open" for item in episode_summaries
+                ),
+                "stuck_count": sum(
+                    item["done_reason"] == "stuck" for item in episode_summaries
+                ),
+                "max_steps_count": sum(
+                    item["done_reason"] == "max_steps" for item in episode_summaries
+                ),
+                "prefix_failure_count": sum(
+                    item["steps"] == 0
+                    and item["done_reason"] != residual_task.success_reason
+                    for item in episode_summaries
+                ),
+                "prefix_failure_reasons": {
+                    reason: sum(
+                        item["steps"] == 0
+                        and item["done_reason"] != residual_task.success_reason
+                        and item["done_reason"] == reason
+                        for item in episode_summaries
+                    )
+                    for reason in sorted(
+                        {
+                            item["done_reason"]
+                            for item in episode_summaries
+                            if item["steps"] == 0
+                            and item["done_reason"] != residual_task.success_reason
+                        }
+                    )
+                },
+                "gripper_hold_activation_count": sum(
+                    item["gripper_hold_activated"] for item in episode_summaries
+                ),
+                "reset_attempts": residual_env.reset_attempts,
+                "rejected_initializations": residual_env.rejected_initializations,
+                "initialization_rejection_rate": (
+                    residual_env.initialization_rejection_rate
+                ),
+                "rejection_reasons": residual_env.rejection_reasons,
+                "mean_reset_elapsed_s": float(np.mean(reset_times)),
+                "total_reset_elapsed_s": float(np.sum(reset_times)),
+                "false_gate_entries": false_gate_entries,
+                "pose_gate_blocked_ungrasped": (
+                    residual_env.pose_gate_blocked_ungrasped
+                ),
+                "contact_force_setup_error": contact_view_error,
+                "gate_reactivations": sum(
+                    item["gate_reactivations"] for item in episode_summaries
+                ),
+                "bottleneck_counts": total_bottlenecks,
+                "terminal_dominance": [
+                    item["terminal_dominates_dense"]
+                    for item in episode_summaries
+                    if item["terminal_dominates_dense"] is not None
+                ],
+            }
+            log_file.write(json.dumps(aggregate) + "\n")
+            print(f"[residual.eval] aggregate={json.dumps(aggregate)}", flush=True)
+
+    if not residual_workflow:
+        _restart_iteration()
+    if auto_play and not residual_workflow:
         try:
             my_world.play()
         except Exception:
             pass
 
     try:
+        if residual_workflow:
+            _run_residual_workflow()
+            return
         while simulation_app.is_running():
             my_world.step(render=True)
 

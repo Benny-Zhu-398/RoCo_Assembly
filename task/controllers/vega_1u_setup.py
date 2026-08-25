@@ -47,6 +47,38 @@ def _resolve_scene_path() -> str:
     return os.path.abspath(os.path.join(pc_dir, pc.SCENE_USD))
 
 
+def _ensure_task_object_placeholders(stage):
+    """Create isolated rigid prims required by the legacy bimanual task API.
+
+    The runner controls parts directly and never consumes these task objects.
+    They must nevertheless be distinct rigid bodies because the task registers
+    each path as a ``SingleRigidPrim``. Reusing a real task part (or registering
+    one dynamic board twice) perturbs PhysX state and can invalidate tensor
+    views when a part is snap-attached.
+    """
+    paths = (pc.L_object_prim_path, pc.R_object_prim_path)
+    if len(set(paths)) != len(paths):
+        raise RuntimeError(f"task object placeholder paths must be distinct: {paths}")
+
+    for index, prim_path in enumerate(paths):
+        cube = UsdGeom.Cube.Define(stage, prim_path)
+        cube.CreateSizeAttr(0.001)
+        cube.CreateVisibilityAttr(UsdGeom.Tokens.invisible)
+        cube.AddTranslateOp().Set(Gf.Vec3d(float(index), 0.0, -100.0))
+        rigid = UsdPhysics.RigidBodyAPI.Apply(cube.GetPrim())
+        # SingleRigidPrim writes pose/velocity during World.reset(), which
+        # requires a dynamic body. Pi0.5 freezes both placeholders immediately
+        # after reset; scripted runs leave these isolated underground bodies
+        # dynamic, where they cannot contact the scene.
+        rigid.CreateKinematicEnabledAttr(False)
+        UsdPhysics.CollisionAPI.Apply(cube.GetPrim())
+        print(
+            f"[setup] created isolated task placeholder {prim_path} "
+            "kinematic=False (freeze-after-reset when requested)",
+            flush=True,
+        )
+
+
 def create_viewport_for_camera(
     viewport_name: str,
     camera_prim_path: str,
@@ -417,6 +449,8 @@ def open_scene_and_world():
         )
     open_stage(usd_path=scene_path)
     print(f"[setup] opened scene: {scene_path}")
+    stage = omni.usd.get_context().get_stage()
+    _ensure_task_object_placeholders(stage)
     # Verify each scene-resident part's mesh world XY against
     # part_init_poses.json. Parts in _AUTOFIX_PARTS (gears) get a
     # delta-based root-translate shift on mismatch — translation commutes
@@ -456,7 +490,8 @@ def _finalize_pick_place_setup(
     my_world.reset()
     if fix_task_board:
         stage = omni.usd.get_context().get_stage()
-        set_rigid_body_kinematic(stage, pc.L_object_prim_path, enabled=True)
+        for prim_path in (pc.L_object_prim_path, pc.R_object_prim_path):
+            set_rigid_body_kinematic(stage, prim_path, enabled=True)
 
 # ---- Per-arm controllers on the shared /vega_1u articulation.
     task_params = my_world.get_task(task_name).get_params()
