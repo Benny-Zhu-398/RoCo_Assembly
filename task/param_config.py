@@ -68,8 +68,8 @@ PART_INIT_POSES = _load_part_init_poses()
 # those parts is pinned in PART_CONFIG to the mesh world xy read from this
 # same file.
 SCENE_USD = "../scene_init.usd"
-L_object_prim_path = "/World/task_board/task_board_color"   # static
-R_object_prim_path = "/World/task_board/task_board_color"
+L_object_prim_path = "/World/roco_task_placeholders/object_L"
+R_object_prim_path = "/World/roco_task_placeholders/object_R"
 
 # Optional path to dump a flattened USD snapshot of the stage when the
 # part iteration finishes (i.e. after all parts in part_order have been
@@ -539,6 +539,22 @@ part_order = (
     "battery_size1",
     "battery_size5",
 )
+
+# Eval-time subset. `ROCO_PART_ORDER="usb_a,hdmi"` restricts the run to those
+# parts, in the given order, without editing this file — needed because each
+# learned-policy checkpoint is trained on one part group, so a rollout must
+# only iterate the parts its checkpoint has seen. Unset (the default) leaves
+# the full sequence above untouched.
+_PART_ORDER_ENV = os.environ.get("ROCO_PART_ORDER", "").strip()
+if _PART_ORDER_ENV:
+    _requested = tuple(n.strip() for n in _PART_ORDER_ENV.split(",") if n.strip())
+    _unknown = [n for n in _requested if n not in part_order]
+    if _unknown:
+        raise ValueError(
+            f"ROCO_PART_ORDER names unknown part(s) {_unknown}; "
+            f"valid names are {list(part_order)}"
+        )
+    part_order = _requested
 
 # Parts already assembled on the board. Their
 # pick/place poses come from PART_CONFIG unchanged. Everything else is a
