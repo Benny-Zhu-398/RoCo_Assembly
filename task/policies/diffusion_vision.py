@@ -75,6 +75,19 @@ have):
                        the grasp is left entirely to BC (default 0.004;
                        set 0 to keep correcting all the way in)
   DP_PICK_CL_DEBUG     "1" -> print arm/correction/lock events
+
+GRIPPER QUANTIZATION (off by default -- raw BC gripper output is a
+continuous value sent straight through with no snapping; diffusion
+sampling noise can land it "closing but not fully closed", which is
+enough to touch a small low-friction part like a battery without actually
+pinching it -- it can look grasped while stationary and then slip out the
+moment the arm accelerates into a lift/reposition move):
+  DP_GRIP_QUANTIZE     "1" -> snap the predicted gripper value to exactly
+                       target.gripper_close or target.gripper_open every
+                       step, instead of passing the raw continuous
+                       prediction through (default off)
+  DP_GRIP_BIAS         boundary position between close/open, as a fraction
+                       of (open - close) from close (default 0.5 = midpoint)
 """
 from __future__ import annotations
 
@@ -163,6 +176,10 @@ class DiffusionVisionPolicy(Policy):
         self._pick_cl_lock = float(os.environ.get("DP_PICK_CL_LOCK_M", "0.004"))
         self._pick_cl_debug = os.environ.get("DP_PICK_CL_DEBUG", "0") == "1"
 
+        # --- gripper quantization (see module docstring) ---
+        self._grip_quantize = os.environ.get("DP_GRIP_QUANTIZE", "0") == "1"
+        self._grip_bias = float(os.environ.get("DP_GRIP_BIAS", "0.5"))
+
         cmd = [server_py, os.path.join(_TASK_DIR, "dp_server_vision.py"), ckpt]
         num_inf = os.environ.get("DP_NUM_INFERENCE_STEPS")
         if num_inf:
@@ -221,6 +238,13 @@ class DiffusionVisionPolicy(Policy):
         self._queue = []
         self._pick_pos = None if target.pick_pos is None else np.asarray(target.pick_pos, dtype=np.float64)
         self._pick_locked = False
+        # This part's commanded open/close gripper values -- once BC's own
+        # predicted grip lands closer to "close" than to "open", the model
+        # has decided to start closing, so stop nudging toward pick_pos (see
+        # _pick_correction). Direction-agnostic (some parts may have
+        # gripper_close > gripper_open) -- compares distance to each, not sign.
+        self._pick_grip_open = float(target.gripper_open)
+        self._pick_grip_close = float(target.gripper_close)
         if not self._skip:
             self._send({"cmd": "reset"})
             self._recv()
@@ -245,14 +269,31 @@ class DiffusionVisionPolicy(Policy):
         assert full.shape == (44,), f"expected 44-D full state, got {full.shape}"
         return full[LEFT_STATE_IDX].astype(np.float32)
 
-    def _pick_correction(self, obs: Observation, pos: np.ndarray) -> np.ndarray:
+    def _pick_correction(self, obs: Observation, pos: np.ndarray, grip: float) -> np.ndarray:
         """Nudge the raw BC xy position toward target.pick_pos on the final
         approach (see module docstring's PICK-SIDE CLOSED LOOP note). z is
         never touched -- descent height/timing stays whatever BC predicted.
-        Once within DP_PICK_CL_LOCK_M, stops correcting for the rest of the
-        episode and hands the actual grasp entirely back to BC, so this
-        never fights the model during gripper closing."""
+
+        Stops correcting (permanently, for the rest of the episode) on
+        whichever of two conditions fires first:
+          - within DP_PICK_CL_LOCK_M of pick_pos, or
+          - BC's own predicted `grip` has moved closer to "close" than to
+            "open", i.e. the model itself has decided to start grasping.
+        The second condition is the one that actually matters in practice:
+        dist_xy isn't guaranteed to ever cross a tight lock threshold (BC's
+        own prediction noise can keep it oscillating a few cm out even as
+        the model closes the gripper -- see the DP_PICK_CL_DEBUG log this
+        was added after), and without it this method would keep tugging the
+        target back toward pick_pos step after step even once the part is
+        already grasped and BC has moved on to carrying it toward place_pos,
+        fighting that motion instead of getting out of the way."""
         if self._pick_cl_mode == "off" or self._pick_pos is None or self._pick_locked:
+            return pos
+
+        if abs(grip - self._pick_grip_close) < abs(grip - self._pick_grip_open):
+            self._pick_locked = True
+            if self._pick_cl_debug:
+                print(f"[pick-cl] LOCKED (grip={grip:.4f} closer to close) -> BC takes over", flush=True)
             return pos
 
         ee = np.asarray(obs.ee_pose_L[0], dtype=np.float64)
@@ -276,6 +317,18 @@ class DiffusionVisionPolicy(Policy):
             print(f"[pick-cl] dist_xy={dist_xy*1000:.1f}mm delta={delta.round(4).tolist()}", flush=True)
         return pos + delta
 
+    def _quantize_gripper(self, grip_pred: float) -> float:
+        """Snap the raw continuous BC gripper prediction to exactly
+        target.gripper_close or target.gripper_open (see module docstring's
+        GRIPPER QUANTIZATION note). No-op when DP_GRIP_QUANTIZE is off or
+        open/close aren't distinct (target didn't supply them)."""
+        if not self._grip_quantize or self._pick_grip_open == self._pick_grip_close:
+            return grip_pred
+        boundary = self._pick_grip_close + self._grip_bias * (self._pick_grip_open - self._pick_grip_close)
+        closing_side = self._pick_grip_close < self._pick_grip_open
+        past_boundary = grip_pred < boundary if closing_side else grip_pred > boundary
+        return self._pick_grip_close if past_boundary else self._pick_grip_open
+
     def act(self, obs: Observation):
         if self._skip:
             return None
@@ -294,9 +347,10 @@ class DiffusionVisionPolicy(Policy):
 
         a = self._queue.pop(0)
         pos = np.asarray(a[:3], dtype=np.float64)
-        pos = self._pick_correction(obs, pos)
-        quat = _euler_xyz_to_quat_wxyz(a[3], a[4], a[5])
         grip = float(a[6])  # raw joint radians -- see diffusion_stateonly.py's GRIPPER UNITS note
+        grip = self._quantize_gripper(grip)
+        pos = self._pick_correction(obs, pos, grip)
+        quat = _euler_xyz_to_quat_wxyz(a[3], a[4], a[5])
         return self.L.forward(pos, quat, grip)
 
     def is_done(self, obs: Observation) -> bool:
