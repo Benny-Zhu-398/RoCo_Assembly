@@ -63,18 +63,37 @@ window, see training/diffusion_policy/speed_error_analysis.py; this nudges
 the raw BC position toward target.pick_pos in xy only, on the final
 approach, before the gripper starts closing -- z is left to BC so descent
 height/timing is unaffected, mirrors diffusion_vision_grouped_grip.py's
-place-side `_endpoint_correction` but on the pick side and without its
-gripper-quantization/lock-and-release machinery, which this file doesn't
-have):
+place-side `_endpoint_correction` but on the pick side):
   DP_PICK_CL_MODE      off | heuristic (default off)
   DP_PICK_CL_TRIGGER_M xy-distance to pick_pos that arms the correction
                        (default 0.05 m)
   DP_PICK_CL_GAIN      proportional gain (default 0.5)
   DP_PICK_CL_MAX_STEP  per-step correction cap in meters (default 0.005)
-  DP_PICK_CL_LOCK_M    xy-distance at which correction stops and the rest of
-                       the grasp is left entirely to BC (default 0.004;
-                       set 0 to keep correcting all the way in)
-  DP_PICK_CL_DEBUG     "1" -> print arm/correction/lock events
+  DP_PICK_CL_LOCK_M    xy-distance at which correction (and the gripper
+                       hold below) stops and the rest of the grasp is left
+                       entirely to BC (default 0.004; set 0 to correct all
+                       the way in, i.e. never lock on distance alone)
+  DP_PICK_CL_DEBUG     "1" -> print arm/correction/lock/hold events
+
+  BC's own decision to start closing the gripper is NOT gated on how well
+  the correction above has actually converged -- observed in practice
+  (2026-08-29 debug run): dist_xy plateaus around 15-20mm, well outside
+  DP_PICK_CL_LOCK_M, while BC closes on its own schedule anyway, freezing
+  that residual xy offset into the grasp -- enough to touch the part but
+  not center it between the fingers, so it isn't retained once the arm
+  accelerates into the lift. DP_PICK_CL_HOLD_MAX_STEPS below overrides BC's
+  gripper command back to "open" for a bounded number of steps once BC
+  wants to close but dist_xy hasn't reached DP_PICK_CL_LOCK_M yet, buying
+  the position correction more time to actually converge before the fingers
+  are allowed to close -- position correction keeps running throughout the
+  hold. Once dist_xy reaches the lock radius (or the hold budget runs out,
+  whichever first), BC's gripper command is passed through unmodified from
+  then on, same as before.
+  DP_PICK_CL_HOLD_MAX_STEPS  max steps to hold the gripper open past what
+                       BC commands while waiting for dist_xy to reach
+                       DP_PICK_CL_LOCK_M (default 20; set 0 to disable the
+                       hold and keep the old "whichever condition fires
+                       first" behavior)
 
 GRIPPER QUANTIZATION (off by default -- raw BC gripper output is a
 continuous value sent straight through with no snapping; diffusion
@@ -96,6 +115,7 @@ import pickle
 import struct
 import subprocess
 import sys
+from typing import Tuple
 
 import numpy as np
 
@@ -112,6 +132,26 @@ from constants import CAMERA_KEYS, LEFT_STATE_IDX  # noqa: E402
 # dataset camera_key -> Observation.rgb dict key (see module docstring's
 # CAMERA KEY MAPPING note).
 _SIM_RGB_KEY = {"head": "head", "left_hand": "L_wrist", "right_hand": "R_wrist"}
+
+# Per-part (close, open) gripper values in the RAW ACTION SPACE the model
+# was actually trained to predict -- NOT param_config.PART_CONFIG's
+# gripper_open/gripper_close (those are controller-space, for the scripted
+# baseline, on a completely different scale; e.g. battery_size5 is
+# (0.11, 0.05) there vs (0.0752, 0.3008) here). Copied verbatim from
+# diffusion_vision_grouped_grip.py's _GRIPPER_DATA, which the same
+# param-config-vs-data-space mismatch was already worked out for -- do not
+# substitute target.gripper_open/target.gripper_close for this.
+_GRIPPER_DATA = {
+    "gear_20teeth":  (0.0977, 0.1805),
+    "gear_60teeth":  (0.1600, 0.3008),
+    "rod_16mm":      (0.0602, 0.3008),
+    "bolt_8mm":      (0.0602, 0.2256),
+    "usb_a":         (0.0602, 0.2256),
+    "hdmi":          (0.0602, 0.2256),
+    "pin":           (0.0827, 0.3008),
+    "battery_size1": (0.1053, 0.3008),
+    "battery_size5": (0.0752, 0.3008),
+}  # (close, open)
 
 
 def _euler_xyz_to_quat_wxyz(rx, ry, rz):
@@ -175,6 +215,7 @@ class DiffusionVisionPolicy(Policy):
         self._pick_cl_max_step = float(os.environ.get("DP_PICK_CL_MAX_STEP", "0.005"))
         self._pick_cl_lock = float(os.environ.get("DP_PICK_CL_LOCK_M", "0.004"))
         self._pick_cl_debug = os.environ.get("DP_PICK_CL_DEBUG", "0") == "1"
+        self._pick_cl_hold_max_steps = int(os.environ.get("DP_PICK_CL_HOLD_MAX_STEPS", "20"))
 
         # --- gripper quantization (see module docstring) ---
         self._grip_quantize = os.environ.get("DP_GRIP_QUANTIZE", "0") == "1"
@@ -215,6 +256,7 @@ class DiffusionVisionPolicy(Policy):
         self._queue = []  # list of (7,) raw actions still to execute from the last predicted horizon
         self._pick_pos = None
         self._pick_locked = False
+        self._pick_hold_steps = 0
 
     # ---- length-prefixed pickle pipe ----
     def _send(self, obj):
@@ -238,13 +280,22 @@ class DiffusionVisionPolicy(Policy):
         self._queue = []
         self._pick_pos = None if target.pick_pos is None else np.asarray(target.pick_pos, dtype=np.float64)
         self._pick_locked = False
-        # This part's commanded open/close gripper values -- once BC's own
-        # predicted grip lands closer to "close" than to "open", the model
-        # has decided to start closing, so stop nudging toward pick_pos (see
-        # _pick_correction). Direction-agnostic (some parts may have
-        # gripper_close > gripper_open) -- compares distance to each, not sign.
-        self._pick_grip_open = float(target.gripper_open)
-        self._pick_grip_close = float(target.gripper_close)
+        self._pick_hold_steps = 0
+        # This part's (close, open) gripper values IN THE MODEL'S RAW ACTION
+        # SPACE (see _GRIPPER_DATA note above) -- used by both
+        # _quantize_gripper and _pick_closed_loop's hold-open logic to tell
+        # whether a predicted grip value means "closing". Direction-agnostic
+        # (some parts may have gripper_close > gripper_open) -- compares
+        # distance to each, not sign.
+        if target.name in _GRIPPER_DATA:
+            self._pick_grip_close, self._pick_grip_open = _GRIPPER_DATA[target.name]
+        else:
+            self._pick_grip_open = float(target.gripper_open)
+            self._pick_grip_close = float(target.gripper_close)
+            print(f"[dp-vision] WARNING: {target.name} not in _GRIPPER_DATA; falling back to "
+                  "target.gripper_open/close, which are controller-space, not the model's action "
+                  "space -- pick-side lock/quantization boundaries may be wrong for this part.",
+                  flush=True)
         if not self._skip:
             self._send({"cmd": "reset"})
             self._recv()
@@ -269,32 +320,28 @@ class DiffusionVisionPolicy(Policy):
         assert full.shape == (44,), f"expected 44-D full state, got {full.shape}"
         return full[LEFT_STATE_IDX].astype(np.float32)
 
-    def _pick_correction(self, obs: Observation, pos: np.ndarray, grip: float) -> np.ndarray:
-        """Nudge the raw BC xy position toward target.pick_pos on the final
-        approach (see module docstring's PICK-SIDE CLOSED LOOP note). z is
-        never touched -- descent height/timing stays whatever BC predicted.
+    def _pick_closed_loop(self, obs: Observation, pos: np.ndarray, grip: float) -> Tuple[np.ndarray, float]:
+        """Xy-only position correction toward target.pick_pos, PLUS holding
+        the gripper open past whatever BC predicts, until the arm is
+        actually within DP_PICK_CL_LOCK_M of pick_pos (see module
+        docstring's PICK-SIDE CLOSED LOOP note). z is never touched --
+        descent height/timing stays whatever BC predicted.
 
-        Stops correcting (permanently, for the rest of the episode) on
-        whichever of two conditions fires first:
-          - within DP_PICK_CL_LOCK_M of pick_pos, or
-          - BC's own predicted `grip` has moved closer to "close" than to
-            "open", i.e. the model itself has decided to start grasping.
-        The second condition is the one that actually matters in practice:
-        dist_xy isn't guaranteed to ever cross a tight lock threshold (BC's
-        own prediction noise can keep it oscillating a few cm out even as
-        the model closes the gripper -- see the DP_PICK_CL_DEBUG log this
-        was added after), and without it this method would keep tugging the
-        target back toward pick_pos step after step even once the part is
-        already grasped and BC has moved on to carrying it toward place_pos,
-        fighting that motion instead of getting out of the way."""
+        The ONLY thing that locks (position correction AND the hold, both
+        permanently, for the rest of the episode) is dist_xy < the lock
+        radius. BC's own gripper-close decision is no longer treated as a
+        stopping condition by itself -- earlier it was, and in practice
+        dist_xy would plateau around 15-20mm (well outside the lock radius)
+        while BC closed on its own schedule anyway, freezing that residual
+        offset into the grasp. Now, if BC wants to close before dist_xy has
+        converged, its grip command is overridden back to "open" for up to
+        DP_PICK_CL_HOLD_MAX_STEPS steps while correction keeps running, so
+        the fingers don't close on an off-center part. If the hold budget
+        runs out first (arm genuinely can't converge further -- don't stall
+        the episode forever), BC's own grip command is let through from
+        then on even though we never locked on distance."""
         if self._pick_cl_mode == "off" or self._pick_pos is None or self._pick_locked:
-            return pos
-
-        if abs(grip - self._pick_grip_close) < abs(grip - self._pick_grip_open):
-            self._pick_locked = True
-            if self._pick_cl_debug:
-                print(f"[pick-cl] LOCKED (grip={grip:.4f} closer to close) -> BC takes over", flush=True)
-            return pos
+            return pos, grip
 
         ee = np.asarray(obs.ee_pose_L[0], dtype=np.float64)
         dist_xy = float(np.linalg.norm(ee[:2] - self._pick_pos[:2]))
@@ -303,19 +350,30 @@ class DiffusionVisionPolicy(Policy):
             self._pick_locked = True
             if self._pick_cl_debug:
                 print(f"[pick-cl] LOCKED at dist_xy={dist_xy*1000:.2f}mm -> BC takes over", flush=True)
-            return pos
+            return pos, grip
 
-        if dist_xy > self._pick_cl_trigger:
-            return pos
+        intends_close = abs(grip - self._pick_grip_close) < abs(grip - self._pick_grip_open)
+        if intends_close and self._pick_hold_steps < self._pick_cl_hold_max_steps:
+            self._pick_hold_steps += 1
+            grip = self._pick_grip_open
+            if self._pick_cl_debug:
+                print(f"[pick-cl] HOLDING open (dist_xy={dist_xy*1000:.1f}mm, "
+                      f"hold_step={self._pick_hold_steps}/{self._pick_cl_hold_max_steps})", flush=True)
+        elif intends_close and self._pick_cl_debug:
+            print(f"[pick-cl] hold budget exhausted at dist_xy={dist_xy*1000:.1f}mm "
+                  "-> letting BC close anyway", flush=True)
 
-        delta = self._pick_cl_gain * (self._pick_pos - ee)
-        delta[2] = 0.0  # xy-only; z left to BC
-        nrm = float(np.linalg.norm(delta))
-        if nrm > self._pick_cl_max_step:
-            delta = delta * (self._pick_cl_max_step / nrm)
-        if self._pick_cl_debug:
-            print(f"[pick-cl] dist_xy={dist_xy*1000:.1f}mm delta={delta.round(4).tolist()}", flush=True)
-        return pos + delta
+        if dist_xy <= self._pick_cl_trigger:
+            delta = self._pick_cl_gain * (self._pick_pos - ee)
+            delta[2] = 0.0  # xy-only; z left to BC
+            nrm = float(np.linalg.norm(delta))
+            if nrm > self._pick_cl_max_step:
+                delta = delta * (self._pick_cl_max_step / nrm)
+            if self._pick_cl_debug:
+                print(f"[pick-cl] dist_xy={dist_xy*1000:.1f}mm delta={delta.round(4).tolist()}", flush=True)
+            pos = pos + delta
+
+        return pos, grip
 
     def _quantize_gripper(self, grip_pred: float) -> float:
         """Snap the raw continuous BC gripper prediction to exactly
@@ -349,7 +407,7 @@ class DiffusionVisionPolicy(Policy):
         pos = np.asarray(a[:3], dtype=np.float64)
         grip = float(a[6])  # raw joint radians -- see diffusion_stateonly.py's GRIPPER UNITS note
         grip = self._quantize_gripper(grip)
-        pos = self._pick_correction(obs, pos, grip)
+        pos, grip = self._pick_closed_loop(obs, pos, grip)
         quat = _euler_xyz_to_quat_wxyz(a[3], a[4], a[5])
         return self.L.forward(pos, quat, grip)
 
