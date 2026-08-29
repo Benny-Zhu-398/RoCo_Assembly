@@ -59,8 +59,9 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     ckpt = load_checkpoint(args.ckpt)
-    if ckpt["part"] != args.part:
-        raise ValueError(f"checkpoint {args.ckpt} was trained for part={ckpt['part']!r}, not --part {args.part!r}")
+    if ckpt["part"] != args.part and args.part not in (ckpt.get("parts") or []):
+        raise ValueError(f"checkpoint {args.ckpt} was trained for part={ckpt['part']!r} / "
+                          f"parts={ckpt.get('parts')!r}, not --part {args.part!r}")
     cfg_dict = ckpt["config"]["data"]
     dataset_root = resolve_repo_path(cfg_dict["dataset_root"])
     val_fraction = cfg_dict["val_fraction"]

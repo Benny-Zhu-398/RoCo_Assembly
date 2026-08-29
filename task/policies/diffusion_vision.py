@@ -56,6 +56,25 @@ Env vars:
   DP_SEED             sampling seed forwarded to the server (default 0)
   DP_SERVER_LOG        stderr log path for the server subprocess (default:
                        task/dp_server_vision.log)
+
+PICK-SIDE CLOSED LOOP (open-loop BC has no safety net on approach --
+open-loop val-set error grows to ~10cm p95 in the fast reach-to-grasp
+window, see training/diffusion_policy/speed_error_analysis.py; this nudges
+the raw BC position toward target.pick_pos in xy only, on the final
+approach, before the gripper starts closing -- z is left to BC so descent
+height/timing is unaffected, mirrors diffusion_vision_grouped_grip.py's
+place-side `_endpoint_correction` but on the pick side and without its
+gripper-quantization/lock-and-release machinery, which this file doesn't
+have):
+  DP_PICK_CL_MODE      off | heuristic (default off)
+  DP_PICK_CL_TRIGGER_M xy-distance to pick_pos that arms the correction
+                       (default 0.05 m)
+  DP_PICK_CL_GAIN      proportional gain (default 0.5)
+  DP_PICK_CL_MAX_STEP  per-step correction cap in meters (default 0.005)
+  DP_PICK_CL_LOCK_M    xy-distance at which correction stops and the rest of
+                       the grasp is left entirely to BC (default 0.004;
+                       set 0 to keep correcting all the way in)
+  DP_PICK_CL_DEBUG     "1" -> print arm/correction/lock events
 """
 from __future__ import annotations
 
@@ -134,6 +153,16 @@ class DiffusionVisionPolicy(Policy):
         n_action_steps_env = os.environ.get("DP_N_ACTION_STEPS")
         self._n_action_steps = int(n_action_steps_env) if n_action_steps_env else None
 
+        # --- pick-side closed-loop config (see module docstring) ---
+        self._pick_cl_mode = os.environ.get("DP_PICK_CL_MODE", "off").strip().lower()
+        if self._pick_cl_mode not in ("off", "heuristic"):
+            raise ValueError(f"DP_PICK_CL_MODE must be off|heuristic, got {self._pick_cl_mode}")
+        self._pick_cl_trigger = float(os.environ.get("DP_PICK_CL_TRIGGER_M", "0.05"))
+        self._pick_cl_gain = float(os.environ.get("DP_PICK_CL_GAIN", "0.5"))
+        self._pick_cl_max_step = float(os.environ.get("DP_PICK_CL_MAX_STEP", "0.005"))
+        self._pick_cl_lock = float(os.environ.get("DP_PICK_CL_LOCK_M", "0.004"))
+        self._pick_cl_debug = os.environ.get("DP_PICK_CL_DEBUG", "0") == "1"
+
         cmd = [server_py, os.path.join(_TASK_DIR, "dp_server_vision.py"), ckpt]
         num_inf = os.environ.get("DP_NUM_INFERENCE_STEPS")
         if num_inf:
@@ -167,6 +196,8 @@ class DiffusionVisionPolicy(Policy):
 
         self._skip = True
         self._queue = []  # list of (7,) raw actions still to execute from the last predicted horizon
+        self._pick_pos = None
+        self._pick_locked = False
 
     # ---- length-prefixed pickle pipe ----
     def _send(self, obj):
@@ -188,6 +219,8 @@ class DiffusionVisionPolicy(Policy):
     def reset(self, obs: Observation, target: PartTarget) -> None:
         self._skip = target.name not in self._target_parts
         self._queue = []
+        self._pick_pos = None if target.pick_pos is None else np.asarray(target.pick_pos, dtype=np.float64)
+        self._pick_locked = False
         if not self._skip:
             self._send({"cmd": "reset"})
             self._recv()
@@ -212,6 +245,37 @@ class DiffusionVisionPolicy(Policy):
         assert full.shape == (44,), f"expected 44-D full state, got {full.shape}"
         return full[LEFT_STATE_IDX].astype(np.float32)
 
+    def _pick_correction(self, obs: Observation, pos: np.ndarray) -> np.ndarray:
+        """Nudge the raw BC xy position toward target.pick_pos on the final
+        approach (see module docstring's PICK-SIDE CLOSED LOOP note). z is
+        never touched -- descent height/timing stays whatever BC predicted.
+        Once within DP_PICK_CL_LOCK_M, stops correcting for the rest of the
+        episode and hands the actual grasp entirely back to BC, so this
+        never fights the model during gripper closing."""
+        if self._pick_cl_mode == "off" or self._pick_pos is None or self._pick_locked:
+            return pos
+
+        ee = np.asarray(obs.ee_pose_L[0], dtype=np.float64)
+        dist_xy = float(np.linalg.norm(ee[:2] - self._pick_pos[:2]))
+
+        if self._pick_cl_lock > 0.0 and dist_xy < self._pick_cl_lock:
+            self._pick_locked = True
+            if self._pick_cl_debug:
+                print(f"[pick-cl] LOCKED at dist_xy={dist_xy*1000:.2f}mm -> BC takes over", flush=True)
+            return pos
+
+        if dist_xy > self._pick_cl_trigger:
+            return pos
+
+        delta = self._pick_cl_gain * (self._pick_pos - ee)
+        delta[2] = 0.0  # xy-only; z left to BC
+        nrm = float(np.linalg.norm(delta))
+        if nrm > self._pick_cl_max_step:
+            delta = delta * (self._pick_cl_max_step / nrm)
+        if self._pick_cl_debug:
+            print(f"[pick-cl] dist_xy={dist_xy*1000:.1f}mm delta={delta.round(4).tolist()}", flush=True)
+        return pos + delta
+
     def act(self, obs: Observation):
         if self._skip:
             return None
@@ -229,7 +293,8 @@ class DiffusionVisionPolicy(Policy):
             self._queue = list(horizon_action[:n])
 
         a = self._queue.pop(0)
-        pos = a[:3]
+        pos = np.asarray(a[:3], dtype=np.float64)
+        pos = self._pick_correction(obs, pos)
         quat = _euler_xyz_to_quat_wxyz(a[3], a[4], a[5])
         grip = float(a[6])  # raw joint radians -- see diffusion_stateonly.py's GRIPPER UNITS note
         return self.L.forward(pos, quat, grip)
