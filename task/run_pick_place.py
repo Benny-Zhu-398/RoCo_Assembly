@@ -70,7 +70,12 @@ from isaacsim.core.api.materials.physics_material import PhysicsMaterial
 from isaacsim.core.utils.prims import is_prim_path_valid
 from isaacsim.core.utils.stage import add_reference_to_stage
 from isaacsim.core.utils.types import ArticulationAction
-from deferred_video import DeferredFrameVideoRecorder
+try:
+    from deferred_video import DeferredFrameVideoRecorder
+except ImportError:
+    # Optional: only needed for --record-video-deferred. Absent in trimmed
+    # checkouts; live ffmpeg recording and every non-recording run still work.
+    DeferredFrameVideoRecorder = None
 from policy_api import EnvInfo, Observation, PartTarget
 
 # Physics material prim authored in the scene USD; bound to every spawned
@@ -892,6 +897,126 @@ def _parse_args():
         "--td3-checkpoint-dir",
         default="artifacts/residual_td3_checkpoints",
     )
+    # --- Grouped-vision DP residual (TD3 through policy.set_residual()) ---
+    parser.add_argument(
+        "--residual-grip-train",
+        action="store_true",
+        help="Train a TD3 xy residual on top of the frozen grouped-vision "
+             "Diffusion Policy via its set_residual() hook. Requires "
+             "--policy policies.diffusion_vision_grouped_grip."
+             "DiffusionVisionGroupedGripPolicy and DP_CL_MODE=residual. "
+             "Reuses the --td3-* knobs.",
+    )
+    parser.add_argument(
+        "--residual-grip-log",
+        default="artifacts/residual_grip_td3_training.jsonl",
+        help="JSONL telemetry path for --residual-grip-train.",
+    )
+    parser.add_argument(
+        "--residual-grip-checkpoint-dir",
+        default="artifacts/residual_grip_td3_checkpoints",
+        help="Directory for --residual-grip-train TD3 checkpoints.",
+    )
+    parser.add_argument(
+        "--residual-grip-settle-steps",
+        type=int,
+        default=90,
+        help="Sim control steps to let the part settle after the frozen "
+             "policy locks and releases, before grading (default: 90).",
+    )
+    parser.add_argument(
+        "--residual-grip-prefix-steps",
+        type=int,
+        default=1500,
+        help="Max frozen-DP control steps per reset to reach the endpoint "
+             "trigger window (default: 1500).",
+    )
+    parser.add_argument(
+        "--residual-grip-max-reset-attempts",
+        type=int,
+        default=10,
+        help="Max sim resets per episode to get the frozen DP into the "
+             "trigger window (default: 10).",
+    )
+    parser.add_argument(
+        "--residual-grip-eval-ckpt",
+        default=None,
+        help="With --residual-grip-train: skip training, load this TD3 "
+             "checkpoint's actor and roll --td3-eval-episodes greedy episodes. "
+             "Add --record-video PATH.mp4 to also write one video of the run.",
+    )
+    # --- Grouped-vision DP GRASP residual (TD3 through set_grasp_residual()) ---
+    parser.add_argument(
+        "--residual-grasp-train",
+        action="store_true",
+        help="Train a TD3 xy residual on the frozen grouped-vision DP's PICK "
+             "target via its set_grasp_residual() hook. Requires "
+             "DP_GRASP_RES_M>0. Placement is left to BC (use DP_CL_MODE=off). "
+             "Reuses the --td3-* knobs.",
+    )
+    parser.add_argument(
+        "--residual-grasp-log",
+        default="artifacts/residual_grasp_td3_training.jsonl",
+    )
+    parser.add_argument(
+        "--residual-grasp-checkpoint-dir",
+        default="artifacts/residual_grasp_td3_checkpoints",
+    )
+    parser.add_argument(
+        "--residual-grasp-max-steps",
+        type=int,
+        default=24,
+        help="Max RL steps of grasp-approach correction per episode (default: 24).",
+    )
+    parser.add_argument(
+        "--residual-grasp-lift-steps",
+        type=int,
+        default=120,
+        help="Max BC control steps to roll the post-grasp lift while checking "
+             "whether the part tracks the gripper (default: 120).",
+    )
+    parser.add_argument(
+        "--residual-grasp-lift-rise-m",
+        type=float,
+        default=0.03,
+        help="Roll BC's lift until the ee has risen this far, then score the "
+             "move-together check (part must rise within move-tol of it). "
+             "Higher = the grasp must survive a bigger lift (default: 0.03).",
+    )
+    parser.add_argument(
+        "--residual-grasp-place-cap",
+        type=int,
+        default=400,
+        help="Max BC control steps to let the place run for the optional "
+             "seat bonus (only after a good lift). 0 disables it (default: 400).",
+    )
+    parser.add_argument(
+        "--residual-grasp-prefix-steps",
+        type=int,
+        default=400,
+        help="Max frozen-DP control steps per reset to reach the grasp "
+             "window (default: 400).",
+    )
+    parser.add_argument(
+        "--residual-grasp-max-reset-attempts",
+        type=int,
+        default=10,
+    )
+    parser.add_argument(
+        "--residual-grasp-ckpt-interval",
+        type=int,
+        default=200,
+        help="Save a grasp checkpoint every N training episodes (must be a "
+             "multiple of --td3-eval-interval; default 200). Eval still runs "
+             "at --td3-eval-interval.",
+    )
+    parser.add_argument(
+        "--residual-grasp-eval-ckpt",
+        default=None,
+        help="With --residual-grasp-train: skip training, load this TD3 "
+             "checkpoint's actor and roll --td3-eval-episodes greedy episodes. "
+             "Add --record-video PATH.mp4 to also write one video of the run.",
+    )
     # SimulationApp consumes argv too; tolerate unknown args so the runner
     # can be launched as ${ISAAC_SIM}/python.sh run_pick_place.py --policy ...
     args = parser.parse_known_args()[0]
@@ -907,6 +1032,30 @@ def _parse_args():
         parser.error("pi0.5 dry-run diagnostic modes are mutually exclusive")
     if args.residual_random_eval and args.residual_td3_train:
         parser.error("residual evaluation and TD3 training modes are mutually exclusive")
+    _residual_modes = sum(bool(v) for v in (
+        args.residual_random_eval, args.residual_td3_train,
+        args.residual_grip_train, args.residual_grasp_train,
+    ))
+    if _residual_modes > 1:
+        parser.error(
+            "choose one residual workflow: --residual-random-eval / "
+            "--residual-td3-train / --residual-grip-train / --residual-grasp-train"
+        )
+    if args.residual_grip_train and (
+        args.residual_grip_settle_steps <= 0
+        or args.residual_grip_prefix_steps <= 0
+        or args.residual_grip_max_reset_attempts <= 0
+    ):
+        parser.error("--residual-grip-* step counts must be positive")
+    if args.residual_grasp_train and (
+        args.residual_grasp_max_steps <= 0
+        or args.residual_grasp_lift_steps <= 0
+        or args.residual_grasp_prefix_steps <= 0
+        or args.residual_grasp_max_reset_attempts <= 0
+        or args.residual_grasp_place_cap < 0
+        or args.residual_grasp_lift_rise_m <= 0.0
+    ):
+        parser.error("--residual-grasp-* counts must be positive (place-cap >= 0)")
     if args.policy_control_hz is not None and args.policy_control_hz <= 0:
         parser.error("--policy-control-hz must be positive")
     if args.pi05_continuous_episode:
@@ -916,6 +1065,12 @@ def _parse_args():
             args.policy_control_hz = 10.0
     if args.record_video_deferred and not args.record_video:
         parser.error("--record-video-deferred requires --record-video")
+    if args.record_video_deferred and DeferredFrameVideoRecorder is None:
+        parser.error(
+            "--record-video-deferred needs the 'deferred_video' module, which "
+            "is not present in this checkout; use --record-video without it "
+            "for live ffmpeg encoding"
+        )
     if (
         args.residual_episodes <= 0
         or args.residual_env_max_steps <= 0
@@ -955,6 +1110,12 @@ def _parse_args():
         "residual_log",
         "td3_log",
         "td3_checkpoint_dir",
+        "residual_grip_log",
+        "residual_grip_checkpoint_dir",
+        "residual_grip_eval_ckpt",
+        "residual_grasp_log",
+        "residual_grasp_checkpoint_dir",
+        "residual_grasp_eval_ckpt",
     ):
         value = getattr(args, attr, None)
         if value and not os.path.isabs(value):
@@ -985,6 +1146,8 @@ def _load_policy_class(dotted_path: str):
 def main():
     args = _parse_args()
     residual_workflow = args.residual_random_eval or args.residual_td3_train
+    grip_residual_workflow = bool(args.residual_grip_train)
+    grasp_residual_workflow = bool(args.residual_grasp_train)
     residual_part_name = None
     if residual_workflow:
         if len(pc.part_order) != 1:
@@ -2321,15 +2484,40 @@ def main():
             log_file.write(json.dumps(aggregate) + "\n")
             print(f"[residual.eval] aggregate={json.dumps(aggregate)}", flush=True)
 
-    if not residual_workflow:
+    _rl_workflow = residual_workflow or grip_residual_workflow or grasp_residual_workflow
+    if not _rl_workflow:
         _restart_iteration()
-    if auto_play and not residual_workflow:
+    if auto_play and not _rl_workflow:
         try:
             my_world.play()
         except Exception:
             pass
 
     try:
+        if grip_residual_workflow or grasp_residual_workflow:
+            if grip_residual_workflow:
+                from residual_grip_train import (
+                    run_grip_residual_training as _run_rl,
+                )
+            else:
+                from residual_grasp_train import (
+                    run_grasp_residual_training as _run_rl,
+                )
+            _run_rl(
+                policy=policy,
+                my_world=my_world,
+                articulation_controller=articulation_controller,
+                build_observation=_build_observation,
+                merge_left_with_right_hold=_merge_left_with_right_hold,
+                apply_init_joint_targets=_apply_init_joint_targets,
+                restart_iteration=_restart_iteration,
+                clear_snap_state=_clear_snap_state,
+                L_controller=L_controller,
+                R_controller=R_controller,
+                args=args,
+                video_recorder_class=FfmpegVideoRecorder,
+            )
+            return
         if residual_workflow:
             _run_residual_workflow()
             return
