@@ -82,18 +82,25 @@ place-side `_endpoint_correction` but on the pick side):
   that residual xy offset into the grasp -- enough to touch the part but
   not center it between the fingers, so it isn't retained once the arm
   accelerates into the lift. DP_PICK_CL_HOLD_MAX_STEPS below overrides BC's
-  gripper command back to "open" for a bounded number of steps once BC
-  wants to close but dist_xy hasn't reached DP_PICK_CL_LOCK_M yet, buying
-  the position correction more time to actually converge before the fingers
-  are allowed to close -- position correction keeps running throughout the
-  hold. Once dist_xy reaches the lock radius (or the hold budget runs out,
-  whichever first), BC's gripper command is passed through unmodified from
-  then on, same as before.
+  gripper command back to "open" for a bounded number of steps (spent only
+  once dist_xy is already within DP_PICK_CL_TRIGGER_M -- BC's gripper
+  channel can flicker "closing" from 30+cm out, long before any real grasp
+  attempt, and spending the budget there starved the final approach of it,
+  also seen in that debug run) once BC wants to close but dist_xy hasn't
+  reached DP_PICK_CL_LOCK_M yet, buying the position correction more time to
+  converge before the fingers are allowed to close. Once dist_xy reaches
+  the lock radius OR the hold budget runs out, EVERYTHING locks -- both
+  position correction and the hold stop permanently and BC drives pos+grip
+  unmodified for the rest of the episode. (An earlier version only
+  released the gripper on hold-exhaustion and kept correcting pos
+  indefinitely after -- that fought whatever BC did once it actually
+  closed/moved on, seen as dist_xy oscillating 50-150mm for the rest of
+  the episode instead of settling; also fixed 2026-08-29.)
   DP_PICK_CL_HOLD_MAX_STEPS  max steps to hold the gripper open past what
                        BC commands while waiting for dist_xy to reach
                        DP_PICK_CL_LOCK_M (default 20; set 0 to disable the
-                       hold and keep the old "whichever condition fires
-                       first" behavior)
+                       hold and lock immediately the first time BC wants
+                       to close, same as before the hold existed)
 
 GRIPPER QUANTIZATION (off by default -- raw BC gripper output is a
 continuous value sent straight through with no snapping; diffusion
@@ -327,19 +334,26 @@ class DiffusionVisionPolicy(Policy):
         docstring's PICK-SIDE CLOSED LOOP note). z is never touched --
         descent height/timing stays whatever BC predicted.
 
-        The ONLY thing that locks (position correction AND the hold, both
-        permanently, for the rest of the episode) is dist_xy < the lock
-        radius. BC's own gripper-close decision is no longer treated as a
-        stopping condition by itself -- earlier it was, and in practice
-        dist_xy would plateau around 15-20mm (well outside the lock radius)
-        while BC closed on its own schedule anyway, freezing that residual
-        offset into the grasp. Now, if BC wants to close before dist_xy has
-        converged, its grip command is overridden back to "open" for up to
-        DP_PICK_CL_HOLD_MAX_STEPS steps while correction keeps running, so
-        the fingers don't close on an off-center part. If the hold budget
-        runs out first (arm genuinely can't converge further -- don't stall
-        the episode forever), BC's own grip command is let through from
-        then on even though we never locked on distance."""
+        Locks (position correction AND further hold attempts, both
+        permanently, for the rest of the episode) on whichever of two
+        conditions fires first:
+          - dist_xy < DP_PICK_CL_LOCK_M, or
+          - BC still wants to close after DP_PICK_CL_HOLD_MAX_STEPS holds
+            have been spent -- accepting we can't converge further and
+            handing BOTH pos and grip back to BC untouched from then on.
+        The second condition locking too (not just releasing the gripper
+        and continuing to correct pos) matters in practice: an earlier
+        version kept nudging pos toward pick_pos indefinitely after the
+        hold budget ran out, and once BC actually closed/moved on, that
+        stale correction fought whatever BC did next -- observed as dist_xy
+        oscillating 50-150mm for the rest of the episode instead of
+        settling (2026-08-29 debug run). Only holds within
+        DP_PICK_CL_TRIGGER_M of pick_pos -- BC's gripper channel can read as
+        "closing" from 30+cm out, long before any real grasp attempt, and
+        spending hold budget on that starves the final approach of the
+        steps it actually needs (also seen in that same run: hold budget
+        exhausted at ~350mm out, none left by the time dist_xy reached
+        14mm)."""
         if self._pick_cl_mode == "off" or self._pick_pos is None or self._pick_locked:
             return pos, grip
 
@@ -352,26 +366,32 @@ class DiffusionVisionPolicy(Policy):
                 print(f"[pick-cl] LOCKED at dist_xy={dist_xy*1000:.2f}mm -> BC takes over", flush=True)
             return pos, grip
 
-        intends_close = abs(grip - self._pick_grip_close) < abs(grip - self._pick_grip_open)
-        if intends_close and self._pick_hold_steps < self._pick_cl_hold_max_steps:
-            self._pick_hold_steps += 1
-            grip = self._pick_grip_open
-            if self._pick_cl_debug:
-                print(f"[pick-cl] HOLDING open (dist_xy={dist_xy*1000:.1f}mm, "
-                      f"hold_step={self._pick_hold_steps}/{self._pick_cl_hold_max_steps})", flush=True)
-        elif intends_close and self._pick_cl_debug:
-            print(f"[pick-cl] hold budget exhausted at dist_xy={dist_xy*1000:.1f}mm "
-                  "-> letting BC close anyway", flush=True)
+        if dist_xy > self._pick_cl_trigger:
+            return pos, grip
 
-        if dist_xy <= self._pick_cl_trigger:
-            delta = self._pick_cl_gain * (self._pick_pos - ee)
-            delta[2] = 0.0  # xy-only; z left to BC
-            nrm = float(np.linalg.norm(delta))
-            if nrm > self._pick_cl_max_step:
-                delta = delta * (self._pick_cl_max_step / nrm)
-            if self._pick_cl_debug:
-                print(f"[pick-cl] dist_xy={dist_xy*1000:.1f}mm delta={delta.round(4).tolist()}", flush=True)
-            pos = pos + delta
+        intends_close = abs(grip - self._pick_grip_close) < abs(grip - self._pick_grip_open)
+        if intends_close:
+            if self._pick_hold_steps < self._pick_cl_hold_max_steps:
+                self._pick_hold_steps += 1
+                grip = self._pick_grip_open
+                if self._pick_cl_debug:
+                    print(f"[pick-cl] HOLDING open (dist_xy={dist_xy*1000:.1f}mm, "
+                          f"hold_step={self._pick_hold_steps}/{self._pick_cl_hold_max_steps})", flush=True)
+            else:
+                self._pick_locked = True
+                if self._pick_cl_debug:
+                    print(f"[pick-cl] hold budget exhausted at dist_xy={dist_xy*1000:.1f}mm "
+                          "-> LOCKED, BC takes over pos+grip", flush=True)
+                return pos, grip
+
+        delta = self._pick_cl_gain * (self._pick_pos - ee)
+        delta[2] = 0.0  # xy-only; z left to BC
+        nrm = float(np.linalg.norm(delta))
+        if nrm > self._pick_cl_max_step:
+            delta = delta * (self._pick_cl_max_step / nrm)
+        if self._pick_cl_debug:
+            print(f"[pick-cl] dist_xy={dist_xy*1000:.1f}mm delta={delta.round(4).tolist()}", flush=True)
+        pos = pos + delta
 
         return pos, grip
 
